@@ -34,14 +34,14 @@ const LINK_ROWS = [
 // Built-in filters (defaults). A filter saved with /addfilter under the same name replaces the built-in one.
 const TEXT = {
   links: '<b>Official Poof links</b>\n\nWebsite: usepoof.chat\nX: @usepoofchat\nDocs: usepoof.chat/docs\nGitHub: github.com/usepoofchat\nTelegram: t.me/usepoofchat\n\nAdmins never DM first.',
-  website: '<b>Poof</b>\nPrivate rooms in your browser. No email, no phone, no account. Nothing is kept.\n\nusepoof.chat',
+  website: '<b>Poof</b>\nPrivate quant-rooms in your browser. No email, no phone, no account. Nothing is kept.\n\nusepoof.chat',
   x: '<b>Poof on X</b>\nNews and updates: @usepoofchat',
-  docs: '<b>Poof docs</b>\nHow rooms work, security, threat model and FAQ.\n\nusepoof.chat/docs',
+  docs: '<b>Poof docs</b>\nHow quant-rooms work, security, threat model and FAQ.\n\nusepoof.chat/docs',
   github: '<b>Poof on GitHub</b>\ngithub.com/usepoofchat',
   ca: '<b>Contract address</b>\nThere is no contract address yet. The official one will be posted here, on usepoof.chat and on X (@usepoofchat) at launch.\n\nNever trust a CA sent to you in DMs.',
   rules: '<b>Poof - Group rules</b>\n\n1. Be respectful. No hate or harassment.\n2. No spam, shilling or unsolicited promotion.\n3. No links from members. Ask an admin to share one.\n4. Admins never DM first. Anyone who does is a scammer.\n5. No financial advice. Do your own research.\n6. English in the main chat.',
   start: '<b>Hi, I\'m the Poof bot.</b>\n\nPoof is a private, temporary chatroom in your browser. Talk freely. Then poof.\n\nSend /help to see everything I can do.',
-  portal: '<b>Welcome to Poof.</b>\n\nPrivate rooms in your browser. No email, no phone, no account. Nothing is kept.\n\nTap <b>Verify and join</b> to enter the community.\nAdmins never DM first.',
+  portal: '<b>Welcome to Poof.</b>\n\nPrivate quant-rooms in your browser. No email, no phone, no account. Nothing is kept.\n\nTap <b>Verify and join</b> to enter the community.\nAdmins never DM first.',
 };
 
 const ALIASES = {
