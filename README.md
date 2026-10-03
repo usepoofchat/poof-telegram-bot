@@ -3,7 +3,7 @@
 The official bot for the Poof community on Telegram ([@usepoofbot](https://t.me/usepoofbot)).
 Poof is a private, temporary chatroom in your browser: [usepoof.chat](https://usepoof.chat).
 
-It runs as a single Cloudflare Worker (`worker.js`) with no other dependencies.
+The whole bot is one file, `worker.js`, with no dependencies.
 
 ## What it does
 - Answers `/help`, `/links`, `/website`, `/x`, `/docs`, `/github`, `/ca` and `/rules` with the official links and texts.
@@ -12,20 +12,13 @@ It runs as a single Cloudflare Worker (`worker.js`) with no other dependencies.
   - Reply to a message (text or photo) with `/addfilter name` to save that message as the filter.
   - `/delfilter name` removes a filter (built-in ones are turned off the same way).
   - `/listfilters` lists all filters.
-- Keeps the pinned welcome post in the Poof Portal channel up to date (`/postportal`, owner only, in the bot DM).
+- Keeps the pinned welcome post in the Poof Portal channel up to date (owner only).
 
-## Setup
-1. Create a Cloudflare Worker and paste `worker.js`.
-2. In the Worker settings add:
-   - a secret `BOT_TOKEN` (from @BotFather)
-   - a KV namespace binding named `FILTERS`
-3. Deploy, then open `https://<worker-url>/setup` once to connect the webhook and the command menu.
-
-The token only lives in the Worker secrets, never in this repo.
+The bot token is never stored in this repository.
 
 ## Assets
 `assets/` holds the media the bot uses (portal and welcome animations, avatars).
-The bot loads them from this repo's `main` branch, so a change here shows up the next time the post is refreshed.
+The bot loads them from this repository's `main` branch.
 
 ## Links
 Website: [usepoof.chat](https://usepoof.chat) · Docs: [usepoof.chat/docs](https://usepoof.chat/docs/) · X: [@usepoofchat](https://x.com/usepoofchat) · Telegram: [t.me/usepoofchat](https://t.me/usepoofchat)

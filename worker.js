@@ -1,6 +1,5 @@
-// Poof Telegram bot (@usepoofbot) - Cloudflare Worker
-// Needs in the Worker settings: secret BOT_TOKEN (from @BotFather) and a KV binding named FILTERS.
-// After deploy, open https://<worker-url>/setup once to connect Telegram.
+// Poof Telegram bot (@usepoofbot)
+// Reads the bot token (BOT_TOKEN) and the filter store (FILTERS) from its environment.
 //
 // Filters work like Guardian, with their own command names so Guardian does not answer too (admins only):
 //   /addfilter website Visit usepoof.chat     add or update a filter, then /website answers with that text
@@ -176,7 +175,7 @@ function toHtml(text, entities, from = 0) {
   return out;
 }
 
-// ---------- filters storage (Cloudflare KV) ----------
+// ---------- filters storage ----------
 const cleanName = s => (s || '').replace(/^\//, '').split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 32);
 
 async function getFilter(env, name) {
@@ -197,7 +196,7 @@ async function listFilters(env) {
   return out;
 }
 
-// override = { name: filterObject | null } for a change KV may not show yet (KV list is eventually consistent)
+// override = { name: filterObject | null } for a change the store may not list yet (listing can lag behind writes)
 async function syncMenu(env, override = {}) {
   let custom = await listFilters(env);
   for (const [n, v] of Object.entries(override)) {
