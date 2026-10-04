@@ -13,6 +13,7 @@ The whole bot is one file, `worker.js`, with no dependencies.
   - `/delfilter name` removes a filter (built-in ones are turned off the same way).
   - `/listfilters` lists all filters.
 - Keeps the pinned welcome post in the Poof Portal channel up to date (owner only).
+- Posts buy alerts for the Poof token in the group (/buybot, admins only). Needs a SQL database bound as DB and a scheduled run every minute.
 
 The bot token is never stored in this repository.
 
