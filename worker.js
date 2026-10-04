@@ -18,6 +18,17 @@ const LINKS = {
 };
 const BOT_USERNAME = 'usepoofbot';
 const OWNER_ID = 8984315558;            // Jason - can manage filters from the bot DM
+// Official Poof chats. Only here can admins manage filters and the buy bot; public commands answer everywhere.
+// Jason adds a chat with /allowchat (sent in that chat) and removes it with /denychat.
+const OFFICIAL_CHATS = [
+  '-1004299037353',   // Poof Portal
+  '-1003939458745',   // Poof - Group
+  '-1004319092641',   // Team
+  '-1004489453598',   // KOLs
+  '-1003925523149',   // Poof shillers
+  '-1004307056422',   // Moderators
+  '-1004325014793',   // BuyBot (test)
+];
 const PORTAL = '@usepoofchat';          // Poof Portal channel
 const VERIFY_URL = 'https://t.me/guardianapp/portal?startapp=HjxHQ5DKnoXIxGr4&mode=compact';
 const IMG = 'https://raw.githubusercontent.com/usepoofchat/poof-telegram-bot/main/assets/';
@@ -79,7 +90,7 @@ const MENU = [
   ['rules', 'Group rules'],
 ];
 const FILTER_CMDS = ['addfilter', 'delfilter', 'listfilters'];
-const RESERVED = [...FILTER_CMDS, 'filter', 'stop', 'filters', 'postportal', 'start', 'help', 'buybot'];
+const RESERVED = [...FILTER_CMDS, 'filter', 'stop', 'filters', 'postportal', 'start', 'help', 'buybot', 'allowchat', 'denychat'];
 
 async function tg(env, method, body) {
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -222,10 +233,30 @@ async function syncMenu(env, override = {}) {
   await tg(env, 'setMyCommands', { commands: commands.slice(0, 100) });
 }
 
+// chats added by Jason with /allowchat (kept in the filter store), plus OFFICIAL_CHATS
+let allowMem = null;
+async function allowedChats(env) {
+  if (allowMem && Date.now() - allowMem.t < 60000) return allowMem.ids;
+  let extra = [];
+  try { extra = env.FILTERS ? JSON.parse((await env.FILTERS.get('allow:chats')) || '[]') : []; } catch (e) { extra = []; }
+  const ids = new Set([...OFFICIAL_CHATS, ...extra.map(String)]);
+  allowMem = { t: Date.now(), ids, extra };
+  return ids;
+}
+async function setAllowed(env, chatId, on) {
+  await allowedChats(env);
+  const extra = new Set(allowMem.extra.map(String));
+  if (on) extra.add(String(chatId)); else extra.delete(String(chatId));
+  await env.FILTERS.put('allow:chats', JSON.stringify([...extra]));
+  allowMem = null;
+}
+const isOfficial = async (env, chatId) => (await allowedChats(env)).has(String(chatId));
+// admin of an official Poof chat (or Jason anywhere)
 async function isAdmin(env, msg) {
   if (!msg.from) return false;
   if (msg.from.id === OWNER_ID) return true;
   if (msg.chat.type === 'private') return false;
+  if (!(await isOfficial(env, msg.chat.id))) return false;
   if (msg.sender_chat && msg.sender_chat.id === msg.chat.id) return true; // anonymous admin
   const r = await tg(env, 'getChatMember', { chat_id: msg.chat.id, user_id: msg.from.id });
   return r.ok && (r.result.status === 'administrator' || r.result.status === 'creator');
@@ -262,7 +293,8 @@ async function sendHelp(env, msg) {
       + '/listfilters - list all filters.\n'
       + 'Do not use /filter: that is Guardian\'s command and gives double replies.\n\n<b>Admins: buy bot</b>\n/buybot - status and settings of the buy alerts in this group.';
     if (msg.chat.type === 'private' && msg.from && msg.from.id === OWNER_ID) {
-      out += '\n\n<b>Owner (in this DM)</b>\n/postportal - refresh the pinned portal post in Poof Portal. Send a GIF/video or photo here with /postportal as caption to use it.';
+      out += '\n\n<b>Owner (in this DM)</b>\n/postportal - refresh the pinned portal post in Poof Portal. Send a GIF/video or photo here with /postportal as caption to use it.'
+        + '\n/allowchat - list official chats here; inside a group, make it official (admins can use filters and the buy bot)\n/denychat - inside a group, take that away';
     }
   }
   await reply(env, msg, out);
@@ -270,7 +302,7 @@ async function sendHelp(env, msg) {
 
 async function handleFilterCommand(env, msg, cmd, text, entities) {
   if (!env.FILTERS) { await reply(env, msg, 'Filter storage is not connected yet.'); return; }
-  if (!(await isAdmin(env, msg))) { await reply(env, msg, 'Only admins can manage filters.'); return; }
+  if (!(await isAdmin(env, msg))) { await reply(env, msg, (msg.chat.type === 'private' || await isOfficial(env, msg.chat.id)) ? 'Only admins can manage filters.' : 'Filters and the buy bot only work in official Poof groups.'); return; }
 
   if (cmd === 'listfilters') {
     const custom = await listFilters(env);
@@ -347,6 +379,18 @@ async function handle(env, update) {
     else if (msg.document && /^video\//.test(msg.document.mime_type || '')) given = { type: 'animation', id: msg.document.file_id };
     const r = await postPortal(env, given);
     await tg(env, 'sendMessage', { chat_id: msg.chat.id, text: r.ok ? (r.edited ? 'Portal post updated.' : 'Portal post published and pinned.') : 'Portal post failed: ' + r.description });
+    return;
+  }
+
+  if ((cmdRaw === 'allowchat' || cmdRaw === 'denychat') && msg.from && msg.from.id === OWNER_ID && env.FILTERS) {
+    if (msg.chat.type === 'private') {
+      await allowedChats(env);
+      await reply(env, msg, '<b>Official chats</b>\nBuilt in: ' + OFFICIAL_CHATS.length + '\nAdded with /allowchat: ' + (allowMem.extra.length ? allowMem.extra.join(', ') : 'none') + '\n\nSend /allowchat or /denychat inside a group to change it.');
+      return;
+    }
+    if (cmdRaw === 'denychat' && OFFICIAL_CHATS.includes(String(msg.chat.id))) { await reply(env, msg, 'This chat is built in as official. Remove it in the code.'); return; }
+    await setAllowed(env, msg.chat.id, cmdRaw === 'allowchat');
+    await reply(env, msg, cmdRaw === 'allowchat' ? 'This chat is now an official Poof chat: admins can use filters and the buy bot here.' : 'This chat is no longer official: filters and the buy bot are off here.');
     return;
   }
 
@@ -730,7 +774,7 @@ async function runBuyBot(env, loopMs = LOOP_MS) {
     let rows = [];
     for (let tick = 0; ; tick++) {
       const t0 = Date.now();
-      if (tick % 5 === 0) rows = (await D.prepare('SELECT chat_id, cfg, last_block FROM bb_chats').all()).results;   // settings changes count within 15 s
+      if (tick % 5 === 0) { const ok = await allowedChats(env); rows = (await D.prepare('SELECT chat_id, cfg, last_block FROM bb_chats').all()).results.filter(x => ok.has(String(x.chat_id))); }   // settings changes count within 15 s; official chats only
       if (tick % 5 === 0) await deleteExpired(env, D);
       for (const row of rows) {
         try { await pollChat(env, D, row); } catch (e) { console.log('buybot', row.chat_id, e && e.message); }
@@ -798,7 +842,7 @@ const BB_HELP = '<b>Commands</b>\n'
 
 async function handleBuybot(env, msg, text) {
   rpcOverride = (env.RPC_URL || '').trim() || null;
-  if (!(await isAdmin(env, msg))) { await reply(env, msg, 'Only admins can set up the buy bot.'); return; }
+  if (!(await isAdmin(env, msg))) { await reply(env, msg, (msg.chat.type === 'private' || await isOfficial(env, msg.chat.id)) ? 'Only admins can set up the buy bot.' : 'Filters and the buy bot only work in official Poof groups.'); return; }
   if (msg.chat.type === 'private' && !/^\/buybot\s+(poll)\b/i.test(text)) { await reply(env, msg, 'Use /buybot inside the group where the alerts should go.'); return; }
   let D;
   try { D = await bbDb(env); } catch (e) { await reply(env, msg, e.message); return; }
