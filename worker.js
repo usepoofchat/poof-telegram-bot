@@ -671,12 +671,12 @@ function tierFor(cfg, usd, mcap) {
   const i = usd >= t[2] ? 3 : usd >= t[1] ? 2 : usd >= t[0] ? 1 : 0;
   return Object.assign({ i }, TIERS[i]);
 }
-// row of emoji that grows with the buy: Big poof starts at 30 emoji, 60 max; the emoji changes with the tier
+// row of emoji that grows with the square root of the buy: plenty for small and mid buys, full (60) at twice the Big poof start; the emoji changes with the tier
 const ROW_EM = [EM.mark, EM.coinInk, EM.poof, EM.foxDollar];
 const ROW_MAX = 60;
 function buyRow(cfg, usd, mcap, tier, E) {
-  const step = Math.max(tierLimits(cfg, mcap)[2] / 30, 1);
-  const n = Math.max(1, Math.min(ROW_MAX, Math.round(usd / step)));
+  const full = Math.max(tierLimits(cfg, mcap)[2] * 2, 1);
+  const n = Math.max(1, Math.min(ROW_MAX, Math.round(ROW_MAX * Math.sqrt(usd / full))));
   return E(ROW_EM[tier.i], '🟧').repeat(n);
 }
 
