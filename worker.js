@@ -429,10 +429,13 @@ const CHAINS = {
     explorer: 'https://robinhoodchain.blockscout.com',
     ds: 'robinhood',        // DexScreener chain id
     uni: 'robinhood',       // Uniswap app chain name
+    v4pm: '0x8366a39cc670b4001a1121b8f6a443a643e40951',   // Uniswap v4 PoolManager (all v4 pools swap through it)
   },
 };
 const TOPIC_V2 = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
 const TOPIC_V3 = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67';
+const TOPIC_V4 = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';   // Swap(bytes32 id, address sender, int128 amount0, int128 amount1, ...)
+const NATIVE = '0x0000000000000000000000000000000000000000';   // native ETH in v4 pools
 const TIERS = [
   { key: 'spark', name: 'Spark' },
   { key: 'puff', name: 'Puff' },
@@ -528,11 +531,21 @@ async function rpc(chain, calls) {
   }
   return out;
 }
-async function getLogsRange(chain, addrs, from, to) {
+// v2/v3 pools log their own swaps; v4 pools all log through the PoolManager, filtered by pool id
+function swapFilters(chain, pools) {
+  const out = [];
+  const v23 = pools.filter(p => p.v !== 'v4'), v4 = pools.filter(p => p.v === 'v4');
+  if (v23.length) out.push({ address: v23.map(p => p.a), topics: [[TOPIC_V2, TOPIC_V3]] });
+  if (v4.length && CHAINS[chain].v4pm) out.push({ address: CHAINS[chain].v4pm, topics: [TOPIC_V4, v4.map(p => p.a.toLowerCase())] });
+  return out;
+}
+async function getLogsRange(chain, pools, from, to) {
   const calls = [];
   const chunk = LOG_CHUNK;   // dRPC free plans (also with a key) reject wider eth_getLogs ranges
-  for (let f = from; f <= to; f += chunk) {
-    calls.push(['eth_getLogs', [{ address: addrs, fromBlock: hex(f), toBlock: hex(Math.min(to, f + chunk - 1)), topics: [[TOPIC_V2, TOPIC_V3]] }]]);
+  for (const flt of swapFilters(chain, pools)) {
+    for (let f = from; f <= to; f += chunk) {
+      calls.push(['eth_getLogs', [Object.assign({ fromBlock: hex(f), toBlock: hex(Math.min(to, f + chunk - 1)) }, flt)]]);
+    }
   }
   const res = await rpc(chain, calls);
   if (res.some(r => !Array.isArray(r))) return null;
@@ -690,16 +703,21 @@ async function pollChat(env, D, row) {
   let from = last ? last + 1 : latest;
   if (latest - from > MAX_RANGE) from = latest - MAX_RANGE;
   if (from > latest) return;
-  const logs = await getLogsRange(cfg.chain, cfg.pools.map(p => p.a), from, latest);
+  const logs = await getLogsRange(cfg.chain, cfg.pools, from, latest);
   if (!logs) { console.log('buybot logs failed', from, latest, rpcLastError); return; }   // try the same range next minute
   const advance = () => { row.last_block = latest; return D.prepare('UPDATE bb_chats SET last_block = ? WHERE chat_id = ?').bind(latest, row.chat_id).run(); };
 
   const byTx = {};
   for (const l of logs) {
-    const p = poolMap[l.address.toLowerCase()];
+    const p = poolMap[(l.topics[0] === TOPIC_V4 ? l.topics[1] : l.address).toLowerCase()];
     if (!p) continue;
     let tokOut = 0n, qIn = 0n;
-    if (l.topics[0] === TOPIC_V2) {
+    if (l.topics[0] === TOPIC_V4) {
+      // v4 amounts are from the trader's side: positive = received, negative = paid
+      const a0 = sword(l.data, 0), a1 = sword(l.data, 1);
+      const tokD = p.t0 ? a0 : a1, qD = p.t0 ? a1 : a0;
+      if (tokD > 0n && qD < 0n) { tokOut = tokD; qIn = -qD; }
+    } else if (l.topics[0] === TOPIC_V2) {
       const a0In = word(l.data, 0), a1In = word(l.data, 1), a0Out = word(l.data, 2), a1Out = word(l.data, 3);
       if (p.t0) { tokOut = a0Out; qIn = a1In; } else { tokOut = a1Out; qIn = a0In; }
     } else {
@@ -804,17 +822,22 @@ async function setupToken(cfgOld, ca, chain, pair) {
   if (!pairs) return { error: 'Could not reach DexScreener right now. Try again in a minute.' };
   const list = (Array.isArray(pairs) ? pairs : (pairs.pairs || (pairs.pair ? [pairs.pair] : [])))
     .filter(p => p.chainId === ch.ds && p.baseToken && p.baseToken.address.toLowerCase() === ca.toLowerCase())
-    .filter(p => (p.labels || []).some(l => l === 'v2' || l === 'v3') && !/^0x[0-9a-f]{64}$/i.test(p.pairAddress))
+    .filter(p => {
+      const lb = p.labels || [];
+      if (lb.includes('v4')) return !!ch.v4pm && /^0x[0-9a-f]{64}$/i.test(p.pairAddress);   // v4 pool id
+      return lb.some(l => l === 'v2' || l === 'v3') && /^0x[0-9a-f]{40}$/i.test(p.pairAddress);
+    })
     .filter(p => ((p.liquidity && p.liquidity.usd) || 0) >= 500)
     .sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0))
     .slice(0, 3);
-  if (!list.length) return { error: 'No Uniswap v2/v3 pool with liquidity found for this token on ' + ch.name + '.' };
+  if (!list.length) return { error: 'No Uniswap v2, v3 or v4 pool with liquidity found for this token on ' + ch.name + '.' };
   const quotes = [...new Set(list.map(p => p.quoteToken.address.toLowerCase()))];
   const dec = await rpc(chain, [ca, ...quotes].map(a => ['eth_call', [{ to: a, data: '0x313ce567' }, 'latest']]));
-  const decOf = i => dec[i] ? parseInt(dec[i], 16) : 18;
+  const decOf = i => { const v = dec[i] ? parseInt(dec[i], 16) : NaN; return v >= 0 && v <= 36 ? v : 18; };   // native ETH has no contract: 18
   const pools = list.map(p => {
     const q = p.quoteToken.address.toLowerCase();
-    return { a: p.pairAddress, v: (p.labels || []).includes('v2') ? 'v2' : 'v3', dex: p.dexId, q, qsym: p.quoteToken.symbol, qdec: decOf(1 + quotes.indexOf(q)), t0: ca.toLowerCase() < q };
+    const v = (p.labels || []).includes('v4') ? 'v4' : (p.labels || []).includes('v2') ? 'v2' : 'v3';
+    return { a: p.pairAddress, v, dex: p.dexId, q, qsym: q === NATIVE ? 'ETH' : p.quoteToken.symbol, qdec: q === NATIVE ? 18 : decOf(1 + quotes.indexOf(q)), t0: ca.toLowerCase() < q };
   });
   const cfg = Object.assign({}, BB_DEFAULT, cfgOld || {}, { chain, token: ca, sym: list[0].baseToken.symbol, dec: decOf(0), pools, pair: list[0].pairAddress, enabled: true });
   return { cfg };
@@ -857,7 +880,7 @@ async function handleBuybot(env, msg, text) {
   if (sub === 'set') {
     const ca = args[1] || '';
     const extra = args.slice(2);
-    const pair = extra.find(x => /^0x[0-9a-fA-F]{40}$/.test(x)) || null;
+    const pair = extra.find(x => /^0x([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(x)) || null;   // pool address, or v4 pool id
     const chain = (extra.find(x => !/^0x/i.test(x)) || 'robinhood').toLowerCase();
     if (!/^0x[0-9a-fA-F]{40}$/.test(ca)) { await reply(env, msg, 'Use: /buybot set 0x... (token contract address)'); return; }
     if (!CHAINS[chain]) { await reply(env, msg, 'Supported chains: ' + Object.keys(CHAINS).join(', ')); return; }
