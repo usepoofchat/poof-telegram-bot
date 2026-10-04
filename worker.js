@@ -430,12 +430,17 @@ const CHAINS = {
     ds: 'robinhood',        // DexScreener chain id
     uni: 'robinhood',       // Uniswap app chain name
     v4pm: '0x8366a39cc670b4001a1121b8f6a443a643e40951',   // Uniswap v4 PoolManager (all v4 pools swap through it)
+    pons: { factory: '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e', page: 'https://www.ponsfamily.com/launchpad/' },   // ponsfamily launchpad: bonding curve, then Uniswap v4
   },
 };
 const TOPIC_V2 = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
 const TOPIC_V3 = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67';
 const TOPIC_V4 = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';   // Swap(bytes32 id, address sender, int128 amount0, int128 amount1, ...)
 const NATIVE = '0x0000000000000000000000000000000000000000';   // native ETH in v4 pools
+const TOPIC_CURVE_BUY = '0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455';   // pons CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)
+const TOPIC_GRADUATED = '0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259';   // pons PoolGraduated(address indexed token, ...)
+const TOPIC_V4_INIT = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';     // v4 Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, ...)
+const PONS_RECHECK = 3000;             // blocks (about 5 min) between on-chain checks that a pons token is still on its curve
 const TIERS = [
   { key: 'spark', name: 'Spark' },
   { key: 'puff', name: 'Puff' },
@@ -532,17 +537,20 @@ async function rpc(chain, calls) {
   return out;
 }
 // v2/v3 pools log their own swaps; v4 pools all log through the PoolManager, filtered by pool id
-function swapFilters(chain, pools) {
+// pons tokens on their bonding curve log CurveBuy on the curve contract; the factory logs PoolGraduated when they move to v4
+function swapFilters(chain, pools, token) {
   const out = [];
-  const v23 = pools.filter(p => p.v !== 'v4'), v4 = pools.filter(p => p.v === 'v4');
+  const v23 = pools.filter(p => p.v === 'v2' || p.v === 'v3'), v4 = pools.filter(p => p.v === 'v4'), curve = pools.filter(p => p.v === 'curve');
   if (v23.length) out.push({ address: v23.map(p => p.a), topics: [[TOPIC_V2, TOPIC_V3]] });
   if (v4.length && CHAINS[chain].v4pm) out.push({ address: CHAINS[chain].v4pm, topics: [TOPIC_V4, v4.map(p => p.a.toLowerCase())] });
+  if (curve.length) out.push({ address: curve.map(p => p.a), topics: [TOPIC_CURVE_BUY] });
+  if (curve.length && CHAINS[chain].pons && token) out.push({ address: CHAINS[chain].pons.factory, topics: [TOPIC_GRADUATED, '0x' + pad32(token)] });
   return out;
 }
-async function getLogsRange(chain, pools, from, to) {
+async function getLogsRange(chain, pools, from, to, token) {
   const calls = [];
   const chunk = LOG_CHUNK;   // dRPC free plans (also with a key) reject wider eth_getLogs ranges
-  for (const flt of swapFilters(chain, pools)) {
+  for (const flt of swapFilters(chain, pools, token)) {
     for (let f = from; f <= to; f += chunk) {
       calls.push(['eth_getLogs', [Object.assign({ fromBlock: hex(f), toBlock: hex(Math.min(to, f + chunk - 1)) }, flt)]]);
     }
@@ -555,7 +563,62 @@ async function getLogsRange(chain, pools, from, to) {
 const DS_HEADERS = { accept: 'application/json', 'user-agent': 'poof-bot/1.0 (+https://usepoof.chat)' };
 // price from DexScreener, cached in the database so a rate-limited minute still has numbers
 const pxMem = {};
+// ETH in dollars (for pons curves, which DexScreener does not list): Coinbase, cached
+let ethMem = null;
+async function ethUsd(D) {
+  if (ethMem && Date.now() - ethMem.t < 60000) return ethMem.usd;
+  let usd = 0;
+  try { const r = await fetch('https://api.coinbase.com/v2/prices/ETH-USD/spot'); if (r.ok) usd = +JSON.parse(await r.text()).data.amount || 0; } catch (e) { /* cache */ }
+  if (usd > 0) { ethMem = { usd, t: Date.now() }; if (D) await kvSet(D, 'px:ethusd', ethMem); return usd; }
+  const c = D ? await kvGet(D, 'px:ethusd') : null;
+  return c && Date.now() - c.t < 3600e3 ? c.usd : 0;
+}
+const quoteUsdOf = async (p, D) => (p.q === NATIVE || /^W?ETH$/i.test(p.qsym || '')) ? ethUsd(D) : /^USD/i.test(p.qsym || '') ? 1 : 0;
+function abiString(h) {
+  try {
+    if (!h || h.length < 130) return '';
+    const len = parseInt(h.slice(66, 130), 16), hx = h.slice(130, 130 + len * 2);
+    return new TextDecoder().decode(new Uint8Array((hx.match(/../g) || []).map(x => parseInt(x, 16)))).replace(/[^\x20-\x7e]/g, '').slice(0, 20);
+  } catch (e) { return ''; }
+}
+// pons launch info from its factory: null when the token is not a pons V2 launch
+async function ponsLaunch(chain, ca) {
+  const ch = CHAINS[chain];
+  if (!ch.pons) return null;
+  const [r] = await rpc(chain, [['eth_call', [{ to: ch.pons.factory, data: '0x3cf28b5a' + pad32(ca) }, 'latest']]]);   // getLaunchedToken(address)
+  if (!r || r.length < 2 + 64 * 15) return null;
+  const w = i => r.slice(2 + 64 * i, 66 + 64 * i);
+  if (!parseInt(w(14), 16)) return null;
+  return { curve: '0x' + w(1).slice(24), pairToken: ('0x' + w(4).slice(24)).toLowerCase(), phase: parseInt(w(10), 16) };   // phase 0 curve, 1 curve full, 2 on Uniswap v4
+}
+// the v4 pool a pons token graduated into: the PoolManager's Initialize log in the graduation transaction
+async function ponsPool(chain, txHash, token) {
+  const ch = CHAINS[chain];
+  const [rc] = await rpc(chain, [['eth_getTransactionReceipt', [txHash]]]);
+  const t = token.toLowerCase();
+  const l = rc && (rc.logs || []).find(x => x.address.toLowerCase() === ch.v4pm && x.topics[0] === TOPIC_V4_INIT && [x.topics[2], x.topics[3]].some(c => ('0x' + c.slice(26)).toLowerCase() === t));
+  if (!l) return null;
+  const c0 = ('0x' + l.topics[2].slice(26)).toLowerCase(), c1 = ('0x' + l.topics[3].slice(26)).toLowerCase();
+  const t0 = c0 === t, q = t0 ? c1 : c0;
+  let qsym = 'ETH', qdec = 18;
+  if (q !== NATIVE) {
+    const [sh, dh] = await rpc(chain, [['eth_call', [{ to: q, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: q, data: '0x313ce567' }, 'latest']]]);
+    qsym = abiString(sh) || 'TOKEN'; qdec = dh ? parseInt(dh, 16) || 18 : 18;
+  }
+  return { a: l.topics[1], v: 'v4', dex: 'uniswap', q, qsym, qdec, t0 };
+}
+async function sendGraduation(env, D, chatId, cfg) {
+  const ids = cfg.emoji ? await emojiIds(env, D) : null, E = emojiFn(ids);
+  const sym = esc(cfg.sym || 'TOKEN');
+  const caption = `${E(EM.mark, '🟧')} <b>$${sym} graduated</b>\n\n${E(EM.foxGaze, '🦊')} The bonding curve is full. $${sym} now trades on Uniswap v4 and the buy alerts continue from the new pool.`;
+  const media = mediaMem.bigpoof || (IMG + 'buybot/bigpoof.mp4');
+  let r = await tgWait(env, 'sendAnimation', { chat_id: chatId, animation: media, caption, parse_mode: 'HTML', reply_markup: buyButtons(cfg, ids) });
+  if (!r.ok) r = await tgWait(env, 'sendMessage', { chat_id: chatId, text: caption, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: buyButtons(cfg, null) });
+  return r;
+}
+
 async function dexPair(cfg, D) {
+  if (!cfg.pair) return null;   // pons curve: no DexScreener pair yet
   const m = pxMem[cfg.pair];
   if (m && Date.now() - m.t < 10000) return m;
   let fresh = null;
@@ -625,7 +688,7 @@ function buyCaption(cfg, b, tier, mcap, E, test, rest = []) {
   s += `${E(EM.foxDollar, '💸')} <b>${fmtAmt(b.quote)} ${esc(quoteName(b.qsym))}</b> (${fmtUsd(b.usd)})\n`;
   s += `${E(EM.coinInk, '🪙')} <b>${fmtCompact(b.tokens)} ${sym}</b> · <a href="${ch.explorer}/tx/${b.tx}">Tx</a>\n`;
   if (b.from) s += `${E(EM.foxHi, '👤')} <a href="${ch.explorer}/address/${b.from}">${shortAddr(b.from)}</a> · ${b.newHolder ? 'New holder' : 'Position +' + fmtPct(b.pos)}\n`;
-  if (mcap) s += `${E(EM.coinStone, '📊')} MCap ${fmtUsd(mcap)}\n`;
+  if (mcap) s += `${E(EM.coinStone, '📊')} MCap ${fmtUsd(mcap)}${cfg.pools && cfg.pools[0] && cfg.pools[0].v === 'curve' ? ' · bonding curve' : ''}\n`;
   if (rest.length) {
     const sum = rest.reduce((a, x) => a + x.usd, 0);
     s += `\n<b>+${rest.length} more ${rest.length === 1 ? 'buy' : 'buys'}</b> · ${fmtUsd(sum)}\n`;
@@ -640,8 +703,9 @@ function buyCaption(cfg, b, tier, mcap, E, test, rest = []) {
 
 function buyButtons(cfg, ids) {
   const ch = CHAINS[cfg.chain];
-  const chart = { text: 'Chart', url: `https://dexscreener.com/${ch.ds}/${cfg.pair}` };
-  const buy = { text: 'Buy', url: `https://app.uniswap.org/swap?chain=${ch.uni}&inputCurrency=ETH&outputCurrency=${cfg.token}` };
+  const onCurve = cfg.pools && cfg.pools[0] && cfg.pools[0].v === 'curve' && ch.pons;
+  const chart = { text: 'Chart', url: onCurve ? ch.pons.page + cfg.token : `https://dexscreener.com/${ch.ds}/${cfg.pair}` };
+  const buy = { text: 'Buy', url: onCurve ? ch.pons.page + cfg.token : `https://app.uniswap.org/swap?chain=${ch.uni}&inputCurrency=ETH&outputCurrency=${cfg.token}` };
   const site = { text: 'usepoof.chat', url: SITE };
   if (ids) {
     if (ids[EM.coinStone]) chart.icon_custom_emoji_id = ids[EM.coinStone];
@@ -703,16 +767,31 @@ async function pollChat(env, D, row) {
   let from = last ? last + 1 : latest;
   if (latest - from > MAX_RANGE) from = latest - MAX_RANGE;
   if (from > latest) return;
-  const logs = await getLogsRange(cfg.chain, cfg.pools, from, latest);
+  const onCurve = cfg.pools[0].v === 'curve';
+  // safety net: a pons token that graduated while alerts were off moves to its v4 pool here
+  if (onCurve && latest - ((cfg.pons && cfg.pons.checked) || 0) > PONS_RECHECK) {
+    const lp = await ponsLaunch(cfg.chain, cfg.token).catch(() => null);
+    cfg.pons = Object.assign({}, cfg.pons, { checked: latest });
+    if (lp && lp.phase === 2) {
+      const res = await setupToken(Object.assign({}, cfg, { pons: null }), cfg.token, cfg.chain, null, true);
+      if (res.cfg) { row.cfg = JSON.stringify(res.cfg); await saveChatCfg(D, row.chat_id, res.cfg); await sendGraduation(env, D, row.chat_id, res.cfg); return; }
+    }
+    row.cfg = JSON.stringify(cfg); await saveChatCfg(D, row.chat_id, cfg);
+  }
+  const logs = await getLogsRange(cfg.chain, cfg.pools, from, latest, cfg.token);
   if (!logs) { console.log('buybot logs failed', from, latest, rpcLastError); return; }   // try the same range next minute
   const advance = () => { row.last_block = latest; return D.prepare('UPDATE bb_chats SET last_block = ? WHERE chat_id = ?').bind(latest, row.chat_id).run(); };
 
   const byTx = {};
+  let grad = null;
   for (const l of logs) {
+    if (l.topics[0] === TOPIC_GRADUATED) { grad = { block: parseInt(l.blockNumber, 16), tx: l.transactionHash }; continue; }
     const p = poolMap[(l.topics[0] === TOPIC_V4 ? l.topics[1] : l.address).toLowerCase()];
     if (!p) continue;
-    let tokOut = 0n, qIn = 0n;
-    if (l.topics[0] === TOPIC_V4) {
+    let tokOut = 0n, qIn = 0n, buyer = null;
+    if (l.topics[0] === TOPIC_CURVE_BUY) {
+      qIn = word(l.data, 0); tokOut = word(l.data, 1);   // the buyer shown is the wallet that sent the transaction (recipients are often trading-bot contracts)
+    } else if (l.topics[0] === TOPIC_V4) {
       // v4 amounts are from the trader's side: positive = received, negative = paid
       const a0 = sword(l.data, 0), a1 = sword(l.data, 1);
       const tokD = p.t0 ? a0 : a1, qD = p.t0 ? a1 : a0;
@@ -729,13 +808,37 @@ async function pollChat(env, D, row) {
     const b = byTx[l.transactionHash] || (byTx[l.transactionHash] = { tx: l.transactionHash, tokens: 0, quote: 0, qsym: p.qsym, q: p.q });
     b.tokens += units(tokOut, cfg.dec);
     b.quote += units(qIn, p.qdec);
+    if (onCurve) cfg.curvePx = units(qIn, p.qdec) / Math.max(units(tokOut, cfg.dec), 1e-18);   // last curve price, in the quote token
+  }
+  // graduated: post the curve buys of this range, then move to the new Uniswap v4 pool
+  if (grad) {
+    const pool = await ponsPool(cfg.chain, grad.tx, cfg.token);
+    if (!pool) return;   // receipt not readable yet: try the same range again
+    const next = Object.assign({}, cfg, { pools: [pool], pair: pool.a, pons: Object.assign({}, cfg.pons, { phase: 2 }) });
+    delete next.curvePx;
+    row.cfg = JSON.stringify(next);
+    await D.prepare('UPDATE bb_chats SET cfg = ?, last_block = ? WHERE chat_id = ?').bind(row.cfg, grad.block - 1, row.chat_id).run();
+    row.last_block = grad.block - 1;   // the v4 pool is read from the graduation block on
+    const curveBuys = Object.values(byTx);
+    if (curveBuys.length) await postBuys(env, D, row, cfg, curveBuys, null);
+    await sendGraduation(env, D, row.chat_id, next);
+    return;
   }
   let buys = Object.values(byTx);
   if (!buys.length) { await advance(); return; }
+  await postBuys(env, D, row, cfg, buys, advance);
+}
 
-  const px = await dexPair(cfg, D);
+// prices the buys, keeps those above the minimum and posts one alert (the biggest buy, with the others listed under it)
+async function postBuys(env, D, row, cfg, buys, advance) {
+  let px;
+  if (cfg.pools[0].v === 'curve') {
+    const qUsd = await quoteUsdOf(cfg.pools[0], D);
+    if (!qUsd || !cfg.curvePx) return;   // no ETH price yet: keep these blocks for the next check
+    px = { priceUsd: cfg.curvePx * qUsd, priceNative: cfg.curvePx, mcap: cfg.curvePx * qUsd * (cfg.supply || 1e9) };
+  } else px = await dexPair(cfg, D);
   if (!px || !px.priceUsd) return;   // no price yet: keep these blocks for the next minute
-  await advance();
+  if (advance) await advance();
   const priceUsd = px ? px.priceUsd : 0, mcap = px ? px.mcap : 0;
   // USD value from what the buyer paid (quote token x its USD price); token price as fallback
   const quoteUsd = px && px.priceNative ? px.priceUsd / px.priceNative : 0;
@@ -747,8 +850,7 @@ async function pollChat(env, D, row) {
   const top = buys[0], rest = buys.slice(1);
 
   // buyer = sender of the transaction; position from its balance right after the buy
-  const [tx] = await rpc(cfg.chain, [['eth_getTransactionByHash', [top.tx]]]);
-  top.from = tx && tx.from;
+  if (!top.from) { const [tx] = await rpc(cfg.chain, [['eth_getTransactionByHash', [top.tx]]]); top.from = tx && tx.from; }
   if (top.from) {
     const [balHex] = await rpc(cfg.chain, [['eth_call', [{ to: cfg.token, data: '0x70a08231' + pad32(top.from) }, 'latest']]]);
     const bal = balHex ? units(BigInt(balHex), cfg.dec) : 0;
@@ -809,11 +911,29 @@ async function runBuyBot(env, loopMs = LOOP_MS) {
 }
 
 // ---------- /buybot command (admins) ----------
-async function dsJson(url) {
-  try { const r = await fetch(url, { headers: DS_HEADERS }); return r.ok ? JSON.parse(await r.text()) : null; } catch (e) { return null; }
+async function dsJson(url, tries = 3) {   // DexScreener sometimes refuses a request: try again a second later
+  for (let i = 0; i < tries; i++) {
+    try { const r = await fetch(url, { headers: DS_HEADERS }); if (r.ok) return JSON.parse(await r.text()); } catch (e) { /* retry */ }
+    if (i < tries - 1) await sleep(1000);
+  }
+  return null;
 }
-async function setupToken(cfgOld, ca, chain, pair) {
+async function setupToken(cfgOld, ca, chain, pair, skipPons) {
   const ch = CHAINS[chain];
+  const launch = (pair || skipPons) ? null : await ponsLaunch(chain, ca).catch(() => null);
+  if (launch && launch.phase !== 2) {
+    const q = launch.pairToken;
+    const calls = [['eth_call', [{ to: ca, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: ca, data: '0x313ce567' }, 'latest']], ['eth_call', [{ to: ca, data: '0x18160ddd' }, 'latest']]];
+    if (q !== NATIVE) calls.push(['eth_call', [{ to: q, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: q, data: '0x313ce567' }, 'latest']]);
+    const [sh, dh, th, qsh, qdh] = await rpc(chain, calls);
+    const dec = dh ? parseInt(dh, 16) || 18 : 18;
+    const qsym = q === NATIVE ? 'ETH' : (abiString(qsh) || 'TOKEN'), qdec = q === NATIVE ? 18 : (qdh ? parseInt(qdh, 16) || 18 : 18);
+    if (q !== NATIVE && !/^(W?ETH|USD)/i.test(qsym)) return { error: 'This pons launch is paired with ' + esc(qsym) + '. On the curve only ETH and USD pairs are supported.' };
+    const pools = [{ a: launch.curve, v: 'curve', dex: 'pons', q, qsym, qdec, t0: false }];
+    const cfg = Object.assign({}, BB_DEFAULT, cfgOld || {}, { chain, token: ca, sym: abiString(sh) || 'TOKEN', dec, supply: th ? units(BigInt(th), dec) : 1e9, pools, pair: null, pons: { phase: launch.phase }, enabled: true });
+    delete cfg.curvePx;
+    return { cfg };
+  }
   let pairs = null;
   if (pair) pairs = await dsJson(`https://api.dexscreener.com/latest/dex/pairs/${ch.ds}/${pair}`);
   if (!pairs) pairs = await dsJson(`https://api.dexscreener.com/token-pairs/v1/${ch.ds}/${ca}`);
@@ -840,6 +960,7 @@ async function setupToken(cfgOld, ca, chain, pair) {
     return { a: p.pairAddress, v, dex: p.dexId, q, qsym: q === NATIVE ? 'ETH' : p.quoteToken.symbol, qdec: q === NATIVE ? 18 : decOf(1 + quotes.indexOf(q)), t0: ca.toLowerCase() < q };
   });
   const cfg = Object.assign({}, BB_DEFAULT, cfgOld || {}, { chain, token: ca, sym: list[0].baseToken.symbol, dec: decOf(0), pools, pair: list[0].pairAddress, enabled: true });
+  delete cfg.pons; delete cfg.curvePx;
   return { cfg };
 }
 
@@ -850,6 +971,7 @@ function bbStatus(cfg, lastBlock) {
   return `<b>Poof buy bot</b> · ${cfg.enabled ? 'on' : 'off'}\n\n`
     + `Token: <b>$${esc(cfg.sym)}</b> on ${ch.name}\n<code>${cfg.token}</code>\n`
     + `Pools: ${cfg.pools.map(p => `${p.dex} ${p.v} (${esc(quoteName(p.qsym))})`).join(', ')}\n`
+    + (cfg.pools[0] && cfg.pools[0].v === 'curve' ? 'pons launch: on the bonding curve now, alerts move to Uniswap v4 by themselves when it graduates.\n' : '')
     + `Min buy: ${fmtUsd(cfg.minUsd)} · Alerts poof after: ${cfg.ttl ? cfg.ttl + ' min' : 'never'}\n`
     + `Tiers: ${tiers}\nCustom emoji: ${cfg.emoji ? 'on' : 'off'}\n\n` + BB_HELP;
 }
