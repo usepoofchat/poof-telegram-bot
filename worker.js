@@ -418,29 +418,25 @@ async function handle(env, update) {
 }
 
 // ================= Buy bot =================
-// Posts every buy of the configured token into the group, in Poof style.
+// Posts every buy of the configured Solana token into the group, in Poof style:
+// on the Meteora bonding curve (DBC) first, then on Meteora DAMM v2 after the token graduates.
 // State lives in the SQL database bound as DB (tables are created on first use).
 // Buys are checked every 3 seconds by a scheduled run (started every minute, one at a time); admins configure it with /buybot in the group.
 
-const CHAINS = {
-  robinhood: {
-    name: 'Robinhood Chain',
-    rpcs: ['https://robinhood.drpc.org', 'https://rpc.mainnet.chain.robinhood.com'],
-    explorer: 'https://robinhoodchain.blockscout.com',
-    ds: 'robinhood',        // DexScreener chain id
-    uni: 'robinhood',       // Uniswap app chain name
-    v4pm: '0x8366a39cc670b4001a1121b8f6a443a643e40951',   // Uniswap v4 PoolManager (all v4 pools swap through it)
-    pons: { factory: '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e', page: 'https://www.ponsfamily.com/launchpad/' },   // ponsfamily launchpad: bonding curve, then Uniswap v4
-  },
+const SOLANA = {
+  name: 'Solana',
+  rpcs: ['https://solana-rpc.publicnode.com'],   // used when the SOLANA_RPC_URL secret is missing or failing
+  explorer: 'https://solscan.io',
 };
-const TOPIC_V2 = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
-const TOPIC_V3 = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67';
-const TOPIC_V4 = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';   // Swap(bytes32 id, address sender, int128 amount0, int128 amount1, ...)
-const NATIVE = '0x0000000000000000000000000000000000000000';   // native ETH in v4 pools
-const TOPIC_CURVE_BUY = '0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455';   // pons CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)
-const TOPIC_GRADUATED = '0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259';   // pons PoolGraduated(address indexed token, ...)
-const TOPIC_V4_INIT = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';     // v4 Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, ...)
-const PONS_RECHECK = 3000;             // blocks (about 5 min) between on-chain checks that a pons token is still on its curve
+const WSOL = 'So11111111111111111111111111111111111111112';
+const SOL_DEC = 9;
+// Meteora pool accounts (byte offsets in the account data)
+const DBC = { program: 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN', discs: ['d5e005d16245775c', 'eddbb8172abda923'],   // SPL and Token-2022 curves share one layout
+  mint: 136, baseVault: 168, quoteVault: 200, sqrt: 280, migrated: 305 };
+const DAMM = { program: 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', disc: 'f19a6d0411b16dbc', mintA: 168, mintB: 200, vaultA: 232, vaultB: 264, sqrt: 456 };
+const POOL_AUTH = ['FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM', 'HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC'];   // owners of the DBC and DAMM v2 vaults
+const METAPLEX = 'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s';
+const MIGRATION_LOG = 'Program log: Instruction: MigrationDammV2';
 const TIERS = [
   { key: 'spark', name: 'Spark' },
   { key: 'puff', name: 'Puff' },
@@ -449,7 +445,8 @@ const TIERS = [
 ];
 const MCAP_PCT = [0.005, 0.025, 0.1];   // % of MCap where Puff, Poof and Big poof start
 const FIXED_TIERS = [100, 500, 1500];   // floor for auto tiers (and used when MCap is unknown): launch-size buys of $20 to $4,000 spread over all tiers
-const BB_DEFAULT = { enabled: true, minUsd: 10, ttl: 10, tiers: 'auto', emoji: true };
+const BB_DEFAULT = { enabled: true, minUsd: 20, ttl: 10, tiers: 'auto', emoji: true };   // launch-size buys of $20 and up; tiers follow the MCap by themselves
+const BB_SETTINGS = ['enabled', 'minUsd', 'ttl', 'tiers', 'emoji'];
 const EMOJI_SET = 'usepoof';
 // positions in the usepoof emoji pack
 const EM = { mark: 0, coinInk: 1, coinRust: 3, coinStone: 4, poof: 5, foxHi: 6, foxGaze: 9, foxDollar: 10 };
@@ -457,14 +454,15 @@ const POLL_MS = 3200;                   // live check about every 3 s: at most o
 const LOOP_MS = 300000;                 // one scheduled run keeps checking for 5 min, then hands over to the next run
 const LEASE_MS = 20000;                 // the running check renews its lock every 3 s; if it dies, the lock frees itself after 20 s
 const HANDOFF_MS = 70000;               // in its last 70 s a run hands over as soon as the next run is waiting
-const LAG_BLOCKS = 5;                   // stay half a second behind the chain tip so every RPC node has the block
 const MAX_LIST = 5;                     // extra buys listed under the main alert when several land in the same 3 s
+const MAX_TX = 24;                      // transactions read per check, oldest first; a rush is read over the next checks
+const RPC_RPS = 8;                      // calls per second sent to SOLANA_RPC_URL (free RPC plans usually allow about 10)
+const RPC_BATCH = RPC_RPS;              // calls per JSON-RPC batch: one batch fits in one second
+const GRAD_RECHECK = 300000;            // every 5 min: is the curve migrated without us seeing it (bot off, missed transaction)?
 const sleep = ms => new Promise(res => setTimeout(res, ms));
-const MAX_RANGE = 1200;                 // blocks per run (about 2 min on Robinhood Chain); older blocks are skipped
-const LOG_CHUNK = 100;                  // blocks per eth_getLogs call (free RPC plans allow about 100)
-const RPC_BATCH = 3;                    // calls per JSON-RPC batch (free RPC plans allow 3)
 
 // ---------- storage (SQL database) ----------
+// bb_chats.last_block holds the last Solana transaction signature already read for that chat
 let dbReady = false;
 async function bbDb(env) {
   if (!env.DB) throw new Error('The database is not connected (binding DB).');
@@ -473,6 +471,7 @@ async function bbDb(env) {
       env.DB.prepare('CREATE TABLE IF NOT EXISTS bb_chats (chat_id TEXT PRIMARY KEY, cfg TEXT NOT NULL, last_block INTEGER)'),
       env.DB.prepare('CREATE TABLE IF NOT EXISTS bb_pending (chat_id TEXT, msg_id INTEGER, expires INTEGER)'),
       env.DB.prepare('CREATE TABLE IF NOT EXISTS bb_kv (k TEXT PRIMARY KEY, v TEXT)'),
+      env.DB.prepare('CREATE TABLE IF NOT EXISTS bb_posted (chat_id TEXT, sig TEXT, t INTEGER, PRIMARY KEY (chat_id, sig))'),
     ]);
     dbReady = true;
   }
@@ -489,23 +488,46 @@ async function getChatCfg(D, chatId) {
   const r = await D.prepare('SELECT cfg, last_block FROM bb_chats WHERE chat_id = ?').bind(String(chatId)).first();
   return r ? { cfg: JSON.parse(r.cfg), last_block: r.last_block } : null;
 }
-async function saveChatCfg(D, chatId, cfg, lastBlock) {
-  if (lastBlock === undefined) {
+async function saveChatCfg(D, chatId, cfg, cursor) {
+  if (cursor === undefined) {
     await D.prepare('UPDATE bb_chats SET cfg = ? WHERE chat_id = ?').bind(JSON.stringify(cfg), String(chatId)).run();
   } else {
     await D.prepare('INSERT INTO bb_chats (chat_id, cfg, last_block) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET cfg = excluded.cfg, last_block = excluded.last_block')
-      .bind(String(chatId), JSON.stringify(cfg), lastBlock).run();
+      .bind(String(chatId), JSON.stringify(cfg), cursor).run();
   }
 }
 
-// ---------- chain helpers ----------
-const hex = n => '0x' + n.toString(16);
-const word = (data, i) => BigInt('0x' + (data.slice(2 + i * 64, 2 + (i + 1) * 64) || '0'));
-const sword = (data, i) => { let v = word(data, i); if (v >= (1n << 255n)) v -= (1n << 256n); return v; };
+// ---------- Solana helpers ----------
 const units = (v, dec) => Number(v) / Math.pow(10, dec);
-const pad32 = a => a.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function b58(bytes) {
+  let n = 0n;
+  for (const x of bytes) n = n * 256n + BigInt(x);
+  let s = '';
+  while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+  for (const x of bytes) { if (x) break; s = '1' + s; }
+  return s;
+}
+const isAddr = s => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s || '');
+const fromB64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const hexOf = b => [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+const keyAt = (d, o) => b58(d.slice(o, o + 32));
+const u128At = (d, o) => { let n = 0n; for (let i = 15; i >= 0; i--) n = n * 256n + BigInt(d[o + i]); return n; };
+const u64At = (d, o) => { let n = 0n; for (let i = 7; i >= 0; i--) n = n * 256n + BigInt(d[o + i]); return n; };
+function unb58(s) {   // base58 text to bytes
+  const out = [];
+  for (const c of s) {
+    let carry = B58.indexOf(c);
+    if (carry < 0) throw new Error('not base58');
+    for (let j = 0; j < out.length; j++) { carry += out[j] * 58; out[j] = carry & 255; carry >>= 8; }
+    while (carry) { out.push(carry & 255); carry >>= 8; }
+  }
+  for (const c of s) { if (c !== '1') break; out.push(0); }
+  return Uint8Array.from(out.reverse());
+}
+const TX_OPTS = { maxSupportedTransactionVersion: 1, encoding: 'jsonParsed', commitment: 'confirmed' };   // version 1 transactions are live on Solana: asking for less leaves them unreadable
 
-// RPC_URL (optional Worker secret) is tried first, then the public endpoints of the chain.
+// SOLANA_RPC_URL (Worker secret) is tried first, then the public endpoint.
 let rpcOverride = null;
 let rpcLastError = '';
 const rpcDown = {};
@@ -515,20 +537,49 @@ async function rpcOnce(url, calls) {
   if (!r.ok) throw new Error(new URL(url).host + ' ' + r.status + ' ' + calls.map(c => c[0]).join(',') + ' ' + (await r.text()).slice(0, 140));
   const j = JSON.parse(await r.text());
   const out = [];
-  for (const x of (Array.isArray(j) ? j : [j])) { out[x.id] = x.error ? null : x.result; if (x.error) rpcLastError = new URL(url).host + ': ' + (x.error.message || x.error.code); }
+  for (const x of (Array.isArray(j) ? j : [j])) {
+    out[x.id] = x.error ? null : x.result;
+    if (x.error) {
+      rpcLastError = new URL(url).host + ': ' + (x.error.message || x.error.code);
+      if (x.error.code === 429 || /rate.?limit|too many/i.test(x.error.message || '')) out.throttled = true;
+    }
+  }
   return out;
 }
-async function rpc(chain, calls) {
-  const urls = [...(rpcOverride ? [rpcOverride] : []), ...CHAINS[chain].rpcs];
+// keeps calls to SOLANA_RPC_URL under RPC_RPS per second: waits until n more calls fit in the last second
+const rpcSent = [];
+async function rpcSlot(n) {
+  for (;;) {
+    const now = Date.now();
+    while (rpcSent.length && now - rpcSent[0] >= 1000) rpcSent.shift();
+    if (!rpcSent.length || rpcSent.length + n <= RPC_RPS) { for (let i = 0; i < n; i++) rpcSent.push(now); return; }
+    await sleep(Math.max(50, 1000 - (now - rpcSent[0]) + 20));
+  }
+}
+async function rpc(calls) {
+  const urls = [...(rpcOverride ? [rpcOverride] : []), ...SOLANA.rpcs];
   const out = [];
-  const batch = RPC_BATCH;   // dRPC refuses bigger batches, even with a key
-  for (let i = 0; i < calls.length; i += batch) {
-    const part = calls.slice(i, i + batch);
+  for (let i = 0; i < calls.length; i += RPC_BATCH) {
+    const part = calls.slice(i, i + RPC_BATCH);
     let res = null;
     const errs = [];
     for (const u of urls) {
       if (rpcDown[u] && Date.now() - rpcDown[u] < 120000 && u !== urls[urls.length - 1] && u !== rpcOverride) { errs.push(new URL(u).host + ' skipped'); continue; }
-      try { res = await rpcOnce(u, part); delete rpcDown[u]; break; } catch (e) { errs.push(String(e && e.message).replace(/https?:\/\/\S+/g, '[url]').slice(0, 260)); rpcDown[u] = Date.now(); }
+      try {
+        if (u === rpcOverride) {
+          // paced under the plan's limit; told to slow down: wait a second and send again (twice at most)
+          for (let tries = 0; ; tries++) {
+            await rpcSlot(part.length);
+            try { res = await rpcOnce(u, part); } catch (e) { if (/ 429 /.test(String(e && e.message)) && tries < 2) { await sleep(1100); continue; } throw e; }
+            if (res.throttled && tries < 2) { await sleep(1100); continue; }
+            break;
+          }
+        } else {   // the public endpoint takes one heavy call per request: one after another
+          res = [];
+          for (const c of part) res.push((await rpcOnce(u, [c]))[0]);
+        }
+        delete rpcDown[u]; break;
+      } catch (e) { errs.push(String(e && e.message).replace(/https?:\/\/\S+/g, '[url]').slice(0, 260)); rpcDown[u] = Date.now(); }
     }
     if (!res) throw new Error('RPC unavailable (' + errs.join(' | ') + ')');
     res.forEach((v, j) => { out[i + j] = v; });
@@ -536,106 +587,193 @@ async function rpc(chain, calls) {
   }
   return out;
 }
-// v2/v3 pools log their own swaps; v4 pools all log through the PoolManager, filtered by pool id
-// pons tokens on their bonding curve log CurveBuy on the curve contract; the factory logs PoolGraduated when they move to v4
-function swapFilters(chain, pools, token) {
-  const out = [];
-  const v23 = pools.filter(p => p.v === 'v2' || p.v === 'v3'), v4 = pools.filter(p => p.v === 'v4'), curve = pools.filter(p => p.v === 'curve');
-  if (v23.length) out.push({ address: v23.map(p => p.a), topics: [[TOPIC_V2, TOPIC_V3]] });
-  if (v4.length && CHAINS[chain].v4pm) out.push({ address: CHAINS[chain].v4pm, topics: [TOPIC_V4, v4.map(p => p.a.toLowerCase())] });
-  if (curve.length) out.push({ address: curve.map(p => p.a), topics: [TOPIC_CURVE_BUY] });
-  if (curve.length && CHAINS[chain].pons && token) out.push({ address: CHAINS[chain].pons.factory, topics: [TOPIC_GRADUATED, '0x' + pad32(token)] });
-  return out;
+const signatures = async (addr, opts) => (await rpc([['getSignaturesForAddress', [addr, Object.assign({ commitment: 'confirmed' }, opts)]]]))[0];
+let accSlot = 0;   // slot the last accounts() answer was read at (0 when unknown)
+async function accounts(list) {   // { owner, d } or null for each address
+  if (!list.length) return [];
+  const conv = v => v ? { owner: v.owner, d: fromB64(v.data[0]) } : null;
+  const opts = { encoding: 'base64', commitment: 'confirmed' };
+  if (list.length > 1) {   // one call for all (the public endpoint refuses it: then one by one)
+    try { const [r] = await rpc([['getMultipleAccounts', [list, opts]]]); if (r && Array.isArray(r.value)) { accSlot = (r.context && r.context.slot) || 0; return r.value.map(conv); } } catch (e) { /* one by one */ }
+  }
+  const res = await rpc(list.map(a => ['getAccountInfo', [a, opts]]));
+  accSlot = Math.min(...res.map(r => (r && r.context && r.context.slot) || 0));
+  return res.map(r => (r && r.value) ? conv(r.value) : null);
 }
-async function getLogsRange(chain, pools, from, to, token) {
-  const calls = [];
-  const chunk = LOG_CHUNK;   // dRPC free plans (also with a key) reject wider eth_getLogs ranges
-  for (const flt of swapFilters(chain, pools, token)) {
-    for (let f = from; f <= to; f += chunk) {
-      calls.push(['eth_getLogs', [Object.assign({ fromBlock: hex(f), toBlock: hex(Math.min(to, f + chunk - 1)) }, flt)]]);
+// both pool vault balances as one string: when it has not changed, nobody traded since the last check
+async function vaultState(P) {
+  try {
+    const [t, s] = await accounts([P.tokVault, P.solVault]);
+    if (!t || !s || t.d.length < 72 || s.d.length < 72) return null;
+    const amount = d => { let n = 0n; for (let i = 7; i >= 0; i--) n = n * 256n + BigInt(d[64 + i]); return n; };   // token account amount (u64 at byte 64)
+    return P.a + ':' + amount(t.d) + ':' + amount(s.d);
+  } catch (e) { return null; }
+}
+const cleanSym = s => String(s || '').replace(/[^\x20-\x7e]/g, '').trim().slice(0, 20);
+async function tokenInfo(mint) {   // decimals, supply and (Token-2022) symbol of the mint, null while it does not exist
+  const [r] = await rpc([['getAccountInfo', [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]]]);
+  const info = r && r.value && r.value.data && r.value.data.parsed && r.value.data.parsed.info;
+  if (!info || info.decimals === undefined) return null;
+  const md = (info.extensions || []).find(e => e.extension === 'tokenMetadata');
+  return { dec: info.decimals, supply: units(BigInt(info.supply), info.decimals), sym: cleanSym(md && md.state && md.state.symbol) };
+}
+// token symbol from the RPC provider's asset index; empty when the provider has none
+async function assetSymbol(mint) {
+  if (!rpcOverride) return '';
+  try {
+    await rpcSlot(1);
+    const [a] = await rpcOnce(rpcOverride, [['getAsset', { id: mint }]]);
+    return cleanSym(a && ((a.content && a.content.metadata && a.content.metadata.symbol) || (a.token_info && a.token_info.symbol)));
+  } catch (e) { return ''; }
+}
+// a Meteora pool of this token paired with SOL: which vault holds the token and which holds the SOL
+function readPool(addr, acc, mint) {
+  if (!acc || acc.d.length < 300) return null;
+  const disc = hexOf(acc.d.slice(0, 8));
+  if (acc.owner === DBC.program && DBC.discs.includes(disc)) {
+    if (keyAt(acc.d, DBC.mint) !== mint) return null;
+    return { a: addr, kind: 'dbc', tokVault: keyAt(acc.d, DBC.baseVault), solVault: keyAt(acc.d, DBC.quoteVault), tokA: true, migrated: acc.d[DBC.migrated] === 1 };
+  }
+  if (acc.owner === DAMM.program && disc === DAMM.disc && acc.d.length >= DAMM.sqrt + 16) {
+    const ma = keyAt(acc.d, DAMM.mintA), mb = keyAt(acc.d, DAMM.mintB);
+    if (ma === mint && mb === WSOL) return { a: addr, kind: 'damm', tokVault: keyAt(acc.d, DAMM.vaultA), solVault: keyAt(acc.d, DAMM.vaultB), tokA: true };
+    if (mb === mint && ma === WSOL) return { a: addr, kind: 'damm', tokVault: keyAt(acc.d, DAMM.vaultB), solVault: keyAt(acc.d, DAMM.vaultA), tokA: false };
+  }
+  return null;
+}
+// current price in SOL per token, from the pool's square-root price (Q64.64)
+function spotSol(P, acc, dec) {
+  if (!acc) return 0;
+  const s = Number(u128At(acc.d, P.kind === 'dbc' ? DBC.sqrt : DAMM.sqrt)) / 2 ** 64;
+  let p = s * s;
+  if (!(p > 0) || !isFinite(p)) return 0;
+  if (!P.tokA) p = 1 / p;
+  return p * Math.pow(10, dec - SOL_DEC);
+}
+function readMeta(d, mint) {   // name and symbol from the token's Metaplex metadata account
+  try {
+    if (keyAt(d, 33) !== mint) return null;
+    let o = 65;
+    const str = () => { const n = d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | (d[o + 3] << 24); o += 4; const s = new TextDecoder().decode(d.slice(o, o + n)).replace(/\0/g, '').trim(); o += n; return s; };
+    const name = str(), symbol = str();
+    return { name, symbol: symbol.replace(/[^\x20-\x7e]/g, '').slice(0, 20) };
+  } catch (e) { return null; }
+}
+const txKeys = tx => {   // every account of a transaction, lookup-table addresses included (parsed keys already carry them)
+  const ks = tx.transaction.message.accountKeys;
+  const keys = ks.map(k => (typeof k === 'string' ? k : k.pubkey));
+  const la = tx.meta && tx.meta.loadedAddresses;
+  if (la && !(ks[0] && typeof ks[0] === 'object' && 'source' in ks[0])) keys.push(...(la.writable || []), ...(la.readonly || []));
+  return keys;
+};
+// the Meteora pool of this token that a transaction writes to (launch, swap or migration), plus the token's metadata when the transaction created it
+async function poolFromTx(tx, mint, kinds) {
+  const m = tx.meta || {};
+  const tokenAccts = new Set([...(m.preTokenBalances || []), ...(m.postTokenBalances || [])].map(e => e.accountIndex));
+  const all = tx.transaction.message.accountKeys;
+  const cand = all.map((k, i) => ({ a: typeof k === 'string' ? k : k.pubkey, w: typeof k === 'string' ? true : k.writable, i }))
+    .filter(k => k.w && !tokenAccts.has(k.i) && k.a !== mint && !POOL_AUTH.includes(k.a) && k.i !== 0)   // the payer is a wallet, not a pool
+    .map(k => k.a).slice(0, 24);
+  const accs = await accounts(cand);
+  let pool = null, meta = null;
+  cand.forEach((a, i) => {
+    const p = readPool(a, accs[i], mint);
+    if (p && kinds.includes(p.kind) && !pool) pool = p;
+    if (accs[i] && accs[i].owner === METAPLEX && !meta) meta = readMeta(accs[i].d, mint);
+  });
+  return { pool, meta };
+}
+
+// one buy from a transaction: the pool's token vault goes down and its SOL vault goes up
+// (sells, liquidity changes and fee claims move them some other way and are left out)
+function decodeBuy(tx, sig, P, cfg) {
+  const m = tx && tx.meta;
+  if (!m || m.err) return null;
+  const keys = txKeys(tx);
+  const ti = keys.indexOf(P.tokVault), si = keys.indexOf(P.solVault);
+  if (ti < 0 || si < 0) return null;
+  const amt = (list, i) => { const e = (list || []).find(x => x.accountIndex === i); return e ? BigInt(e.uiTokenAmount.amount) : null; };
+  const sPre = amt(m.preTokenBalances, si) || 0n, sPost = amt(m.postTokenBalances, si);
+  const tPre = amt(m.preTokenBalances, ti), tPost = amt(m.postTokenBalances, ti);
+  if (sPost === null || tPost === null) return null;
+  const solIn = sPost - sPre;
+  // what each wallet gained (or lost) of the token in this transaction, pool vaults left out
+  const gain = {};
+  for (const [list, sign] of [[m.postTokenBalances, 1n], [m.preTokenBalances, -1n]]) {
+    for (const e of list || []) {
+      if (e.mint !== cfg.token || POOL_AUTH.includes(e.owner) || e.accountIndex === ti) continue;
+      gain[e.owner] = (gain[e.owner] || 0n) + sign * BigInt(e.uiTokenAmount.amount);
     }
   }
-  const res = await rpc(chain, calls);
-  if (res.some(r => !Array.isArray(r))) return null;
-  return res.flat();
+  // no vault balance before: the pool was created in this transaction (launch with a first buy)
+  const tokOut = tPre === null ? Object.values(gain).reduce((a, v) => a + (v > 0n ? v : 0n), 0n) : tPre - tPost;
+  if (solIn <= 0n || tokOut <= 0n) return null;
+  // the same row as DexScreener shows for this pool: what went through this pool, made by the wallet that signed
+  // (a routed swap shows only its part in this pool; arbitrage bots buying here show up too, like on DexScreener)
+  const from = keys[0];
+  const ev = swapEvent(tx, P);   // the pool's own swap record: amounts before fees, as DexScreener shows them
+  const held = list => (list || []).filter(e => e.mint === cfg.token && e.owner === from).reduce((a, e) => a + BigInt(e.uiTokenAmount.amount), 0n);
+  const before = held(m.preTokenBalances), after = held(m.postTokenBalances);
+  return {
+    tx: sig, tokens: units(ev ? ev.tok : tokOut, cfg.dec), quote: units(ev ? ev.sol : solIn, SOL_DEC), qsym: 'SOL', from,
+    kept: after > before, newHolder: before === 0n && after > 0n, pos: before > 0n ? Number(after - before) / Number(before) * 100 : 0,
+  };
+}
+
+// The buys a Meteora pool recorded in a transaction (its EvtSwap2 event, emitted as an inner instruction), summed:
+// SOL without the fee when the fee is taken from the SOL paid, tokens with the fee when it is taken from the tokens.
+// Those are the amounts DexScreener shows. null when the transaction carries no readable event (vault balances are used).
+const EVT_SWAP2 = 'e445a52e51cb9a1dbd4233a826507599';
+function swapEvent(tx, P) {
+  const prog = P.kind === 'dbc' ? DBC.program : DAMM.program;
+  let sol = 0n, tok = 0n, n = 0;
+  for (const g of (tx.meta && tx.meta.innerInstructions) || []) {
+    for (const ix of g.instructions || []) {
+      if (ix.programId !== prog || !ix.data) continue;
+      let d;
+      try { d = unb58(ix.data); } catch (e) { continue; }
+      if (d.length < 148 || hexOf(d.slice(0, 16)) !== EVT_SWAP2 || keyAt(d, 16) !== P.a) continue;
+      let inc, exc, out, fee;
+      if (P.kind === 'dbc') {   // pool, config, direction (1 = SOL to token), referral, params, result
+        if (d.length < 171 || d[80] !== 1) continue;
+        inc = u64At(d, 99); exc = u64At(d, 107); out = u64At(d, 123); fee = u64At(d, 147) + u64At(d, 155) + u64At(d, 163);
+      } else {                  // pool, direction (0 = A to B), fee mode, referral, params, result
+        if (d[48] !== (P.tokA ? 1 : 0)) continue;
+        inc = u64At(d, 68); exc = u64At(d, 76); out = u64At(d, 92); fee = u64At(d, 116) + u64At(d, 124) + u64At(d, 132) + u64At(d, 140);
+      }
+      sol += exc; tok += inc > exc ? out : out + fee; n++;
+    }
+  }
+  return n && sol > 0n && tok > 0n ? { sol, tok } : null;
 }
 
 const DS_HEADERS = { accept: 'application/json', 'user-agent': 'poof-bot/1.0 (+https://usepoof.chat)' };
-// price from DexScreener, cached in the database so a rate-limited minute still has numbers
-const pxMem = {};
-// ETH in dollars (for pons curves, which DexScreener does not list): Coinbase, cached
-let ethMem = null;
-async function ethUsd(D) {
-  if (ethMem && Date.now() - ethMem.t < 60000) return ethMem.usd;
+// SOL in dollars: Coinbase, then Kraken, cached in the database so a bad minute still has numbers
+let solMem = null;
+async function solUsd(D) {
+  if (solMem && Date.now() - solMem.t < 60000) return solMem.usd;
   let usd = 0;
-  try { const r = await fetch('https://api.coinbase.com/v2/prices/ETH-USD/spot'); if (r.ok) usd = +JSON.parse(await r.text()).data.amount || 0; } catch (e) { /* cache */ }
-  if (usd > 0) { ethMem = { usd, t: Date.now() }; if (D) await kvSet(D, 'px:ethusd', ethMem); return usd; }
-  const c = D ? await kvGet(D, 'px:ethusd') : null;
+  try { const r = await fetch('https://api.coinbase.com/v2/prices/SOL-USD/spot'); if (r.ok) usd = +JSON.parse(await r.text()).data.amount || 0; } catch (e) { /* next source */ }
+  if (!usd) { try { const r = await fetch('https://api.kraken.com/0/public/Ticker?pair=SOLUSD'); if (r.ok) { const j = JSON.parse(await r.text()); const k = j.result && Object.values(j.result)[0]; usd = k ? +k.c[0] || 0 : 0; } } catch (e) { /* cache */ } }
+  if (usd > 0) { solMem = { usd, t: Date.now() }; if (D) await kvSet(D, 'px:solusd', solMem); return usd; }
+  const c = D ? await kvGet(D, 'px:solusd') : null;
   return c && Date.now() - c.t < 3600e3 ? c.usd : 0;
 }
-const quoteUsdOf = async (p, D) => (p.q === NATIVE || /^W?ETH$/i.test(p.qsym || '')) ? ethUsd(D) : /^USD/i.test(p.qsym || '') ? 1 : 0;
-function abiString(h) {
-  try {
-    if (!h || h.length < 130) return '';
-    const len = parseInt(h.slice(66, 130), 16), hx = h.slice(130, 130 + len * 2);
-    return new TextDecoder().decode(new Uint8Array((hx.match(/../g) || []).map(x => parseInt(x, 16)))).replace(/[^\x20-\x7e]/g, '').slice(0, 20);
-  } catch (e) { return ''; }
-}
-// pons launch info from its factory: null when the token is not a pons V2 launch
-async function ponsLaunch(chain, ca) {
-  const ch = CHAINS[chain];
-  if (!ch.pons) return null;
-  const [r] = await rpc(chain, [['eth_call', [{ to: ch.pons.factory, data: '0x3cf28b5a' + pad32(ca) }, 'latest']]]);   // getLaunchedToken(address)
-  if (!r || r.length < 2 + 64 * 15) return null;
-  const w = i => r.slice(2 + 64 * i, 66 + 64 * i);
-  if (!parseInt(w(14), 16)) return null;
-  return { curve: '0x' + w(1).slice(24), pairToken: ('0x' + w(4).slice(24)).toLowerCase(), phase: parseInt(w(10), 16) };   // phase 0 curve, 1 curve full, 2 on Uniswap v4
-}
-// the v4 pool a pons token graduated into: the PoolManager's Initialize log in the graduation transaction
-async function ponsPool(chain, txHash, token) {
-  const ch = CHAINS[chain];
-  const [rc] = await rpc(chain, [['eth_getTransactionReceipt', [txHash]]]);
-  const t = token.toLowerCase();
-  const l = rc && (rc.logs || []).find(x => x.address.toLowerCase() === ch.v4pm && x.topics[0] === TOPIC_V4_INIT && [x.topics[2], x.topics[3]].some(c => ('0x' + c.slice(26)).toLowerCase() === t));
-  if (!l) return null;
-  const c0 = ('0x' + l.topics[2].slice(26)).toLowerCase(), c1 = ('0x' + l.topics[3].slice(26)).toLowerCase();
-  const t0 = c0 === t, q = t0 ? c1 : c0;
-  let qsym = 'ETH', qdec = 18;
-  if (q !== NATIVE) {
-    const [sh, dh] = await rpc(chain, [['eth_call', [{ to: q, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: q, data: '0x313ce567' }, 'latest']]]);
-    qsym = abiString(sh) || 'TOKEN'; qdec = dh ? parseInt(dh, 16) || 18 : 18;
-  }
-  return { a: l.topics[1], v: 'v4', dex: 'uniswap', q, qsym, qdec, t0 };
+// price and MCap from the pool itself (no waiting for DexScreener at launch)
+async function priceOf(cfg, D) {
+  const usd = await solUsd(D);
+  let px = 0;
+  if (cfg.pool) { try { const [acc] = await accounts([cfg.pool.a]); px = spotSol(cfg.pool, acc, cfg.dec); } catch (e) { /* fallback below */ } }
+  return { solUsd: usd, priceSol: px, mcap: px * usd * (cfg.supply || 1e9) };
 }
 async function sendGraduation(env, D, chatId, cfg) {
   const ids = cfg.emoji ? await emojiIds(env, D) : null, E = emojiFn(ids);
   const sym = esc(cfg.sym || 'TOKEN');
-  const caption = `${E(EM.mark, '🟧')} <b>$${sym} graduated</b>\n\n${E(EM.foxGaze, '🦊')} The bonding curve is full. $${sym} now trades on Uniswap v4 and the buy alerts continue from the new pool.`;
+  const caption = `${E(EM.mark, '🟧')} <b>$${sym} graduated</b>\n\n${E(EM.foxGaze, '🦊')} The bonding curve is full. $${sym} now trades on Meteora DAMM v2 and the buy alerts continue from the new pool.`;
   const media = mediaMem.bigpoof || (IMG + 'buybot/bigpoof.mp4');
   let r = await tgWait(env, 'sendAnimation', { chat_id: chatId, animation: media, caption, parse_mode: 'HTML', reply_markup: buyButtons(cfg, ids) });
   if (!r.ok) r = await tgWait(env, 'sendMessage', { chat_id: chatId, text: caption, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: buyButtons(cfg, null) });
   return r;
-}
-
-async function dexPair(cfg, D) {
-  if (!cfg.pair) return null;   // pons curve: no DexScreener pair yet
-  const m = pxMem[cfg.pair];
-  if (m && Date.now() - m.t < 10000) return m;
-  let fresh = null;
-  try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/pairs/${CHAINS[cfg.chain].ds}/${cfg.pair}`, { headers: DS_HEADERS });
-    if (r.ok) {
-      const j = JSON.parse(await r.text());
-      const p = (j.pairs || [])[0] || j.pair;
-      if (p && +p.priceUsd) fresh = { priceUsd: +p.priceUsd, priceNative: +p.priceNative || 0, mcap: +(p.marketCap || p.fdv) || 0, t: Date.now() };
-    }
-  } catch (e) { /* use cache */ }
-  if (D) {
-    if (fresh) await kvSet(D, 'px:' + cfg.pair, fresh);
-    else fresh = await kvGet(D, 'px:' + cfg.pair);
-  }
-  if (fresh && fresh.t && Date.now() - fresh.t < 10000) pxMem[cfg.pair] = fresh;
-  return fresh;
 }
 
 // ---------- formatting ----------
@@ -648,9 +786,17 @@ function fmtCompact(n) {
 }
 const fmtUsd = n => '$' + (n >= 1e6 ? fmtCompact(n) : n >= 1 ? Math.round(n).toLocaleString('en-US') : n.toFixed(2));
 const fmtAmt = n => n >= 100 ? Math.round(n).toLocaleString('en-US') : n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : n.toPrecision(2);
+// a trade written the way DexScreener writes its rows (cut, not rounded): SOL with 2 decimals, or 4 significant digits
+// under 1; dollars with cents; tokens whole from 10,000, with 2 decimals under that
+const cutTo = (n, d) => Math.floor(n * 10 ** d + 1e-9) / 10 ** d;
+const sig4 = n => { if (!(n > 0)) return '0'; const d = Math.max(0, 3 - Math.floor(Math.log10(n))); return cutTo(n, d).toFixed(d); };
+const dec2 = n => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtSolDs = n => (n >= 1 ? dec2(cutTo(n, 2)) : sig4(n));
+const fmtUsdDs = n => '$' + dec2(n);
+const fmtTokDs = n => (n >= 10000 ? Math.floor(n).toLocaleString('en-US') : n >= 1 ? dec2(cutTo(n, 2)) : sig4(n));
 const fmtPct = n => (n >= 1000 ? Math.round(n).toLocaleString('en-US') : n >= 10 ? Math.round(n) : n.toFixed(1)) + '%';
 const shortAddr = a => a.slice(0, 6) + '…' + a.slice(-4);
-const quoteName = s => /^W?ETH$/i.test(s || '') ? 'ETH' : (s || '');
+const quoteName = s => /^W?SOL$/i.test(s || '') ? 'SOL' : (s || '');
 
 let emojiMem = null;
 async function emojiIds(env, D) {
@@ -681,19 +827,19 @@ function buyRow(cfg, usd, mcap, tier, E) {
 }
 
 function buyCaption(cfg, b, tier, mcap, E, test, rest = []) {
-  const ch = CHAINS[cfg.chain];
+  const ex = SOLANA.explorer;
   const sym = esc(cfg.sym || 'TOKEN');
   let s = `${E(EM.mark, '🟧')} <b>$${sym} buy</b> · ${tier.name}${test ? ' <i>(test)</i>' : ''}\n\n`;
   s += buyRow(cfg, b.usd, mcap, tier, E) + '\n\n';
-  s += `${E(EM.foxDollar, '💸')} <b>${fmtAmt(b.quote)} ${esc(quoteName(b.qsym))}</b> (${fmtUsd(b.usd)})\n`;
-  s += `${E(EM.coinInk, '🪙')} <b>${fmtCompact(b.tokens)} ${sym}</b> · <a href="${ch.explorer}/tx/${b.tx}">Tx</a>\n`;
-  if (b.from) s += `${E(EM.foxHi, '👤')} <a href="${ch.explorer}/address/${b.from}">${shortAddr(b.from)}</a> · ${b.newHolder ? 'New holder' : 'Position +' + fmtPct(b.pos)}\n`;
-  if (mcap) s += `${E(EM.coinStone, '📊')} MCap ${fmtUsd(mcap)}${cfg.pools && cfg.pools[0] && cfg.pools[0].v === 'curve' ? ' · bonding curve' : ''}\n`;
+  s += `${E(EM.foxDollar, '💸')} <b>${fmtSolDs(b.quote)} ${esc(quoteName(b.qsym))}</b> (${fmtUsdDs(b.usd)})\n`;
+  s += `${E(EM.coinInk, '🪙')} <b>${fmtTokDs(b.tokens)} ${sym}</b> · <a href="${ex}/tx/${b.tx}">Tx</a>\n`;
+  if (b.from) s += `${E(EM.foxHi, '👤')} <a href="${ex}/account/${b.from}">${shortAddr(b.from)}</a>${b.kept === false ? '' : ' · ' + (b.newHolder ? 'New holder' : 'Position +' + fmtPct(b.pos))}\n`;
+  if (mcap) s += `${E(EM.coinStone, '📊')} MCap ${fmtUsd(mcap)}${cfg.pool && cfg.pool.kind === 'dbc' ? ' · bonding curve' : ''}\n`;
   if (rest.length) {
     const sum = rest.reduce((a, x) => a + x.usd, 0);
     s += `\n<b>+${rest.length} more ${rest.length === 1 ? 'buy' : 'buys'}</b> · ${fmtUsd(sum)}\n`;
     for (const x of rest.slice(0, MAX_LIST)) {
-      s += `${E(ROW_EM[tierFor(cfg, x.usd, mcap).i], '🟧')} ${fmtAmt(x.quote)} ${esc(quoteName(x.qsym))} (${fmtUsd(x.usd)}) · <a href="${ch.explorer}/tx/${x.tx}">Tx</a>\n`;
+      s += `${E(ROW_EM[tierFor(cfg, x.usd, mcap).i], '🟧')} ${fmtSolDs(x.quote)} ${esc(quoteName(x.qsym))} (${fmtUsdDs(x.usd)}) · <a href="${ex}/tx/${x.tx}">Tx</a>\n`;
     }
     if (rest.length > MAX_LIST) s += `<i>and ${rest.length - MAX_LIST} more</i>\n`;
   }
@@ -702,10 +848,8 @@ function buyCaption(cfg, b, tier, mcap, E, test, rest = []) {
 }
 
 function buyButtons(cfg, ids) {
-  const ch = CHAINS[cfg.chain];
-  const onCurve = cfg.pools && cfg.pools[0] && cfg.pools[0].v === 'curve' && ch.pons;
-  const chart = { text: 'Chart', url: onCurve ? ch.pons.page + cfg.token : `https://dexscreener.com/${ch.ds}/${cfg.pair}` };
-  const buy = { text: 'Buy', url: onCurve ? ch.pons.page + cfg.token : `https://app.uniswap.org/swap?chain=${ch.uni}&inputCurrency=ETH&outputCurrency=${cfg.token}` };
+  const chart = { text: 'Chart', url: `https://dexscreener.com/solana/${cfg.token}` };
+  const buy = { text: 'Buy', url: `https://jup.ag/swap/SOL-${cfg.token}` };
   const site = { text: 'usepoof.chat', url: SITE };
   if (ids) {
     if (ids[EM.coinStone]) chart.icon_custom_emoji_id = ids[EM.coinStone];
@@ -754,117 +898,222 @@ async function sendBuy(env, D, chatId, cfg, b, mcap, test, rest = []) {
   return r;
 }
 
+
 // ---------- polling ----------
+const missMem = {};   // checks in a row where a transaction was listed but not readable yet
+const gradMem = {};   // safety check for a graduation the live check did not see
+const vaultMem = {};  // pool vault balances at the last check, per chat
+const afterMem = {};  // pool vault balances left by the last transaction read, per chat
+const gapMem = {};    // checks in a row that stopped at a gap in the vault balances, per chat
+// a transaction's pool vault balances before and after it, as 'pool:token:sol' strings (null when it does not carry them)
+function vaultsOf(tx, P) {
+  const m = tx && tx.meta;
+  if (!m) return null;
+  const keys = txKeys(tx), ti = keys.indexOf(P.tokVault), si = keys.indexOf(P.solVault);
+  if (ti < 0 || si < 0) return null;
+  const at = (list, i) => { const e = (list || []).find(x => x.accountIndex === i); return e ? e.uiTokenAmount.amount : null; };
+  const pt = at(m.postTokenBalances, ti), ps = at(m.postTokenBalances, si);
+  if (pt === null || ps === null) return null;
+  const bt = at(m.preTokenBalances, ti), bs = at(m.preTokenBalances, si);
+  return { pre: bt !== null && bs !== null ? P.a + ':' + bt + ':' + bs : null, post: P.a + ':' + pt + ':' + ps };
+}
+const setCursor = (D, row, sig) => { row.last_block = sig; return D.prepare('UPDATE bb_chats SET last_block = ? WHERE chat_id = ?').bind(sig, row.chat_id).run(); };
+
 async function pollChat(env, D, row) {
   const cfg = Object.assign({}, BB_DEFAULT, JSON.parse(row.cfg));
-  if (!cfg.enabled || !cfg.pools || !cfg.pools.length) return;
-  const poolMap = {};
-  for (const p of cfg.pools) poolMap[p.a.toLowerCase()] = p;
-  const last = row.last_block || 0;
-  const [bnHex] = await rpc(cfg.chain, [['eth_blockNumber', []]]);
-  const latest = parseInt(bnHex, 16) - LAG_BLOCKS;
-  if (!(latest > 0)) return;
-  let from = last ? last + 1 : latest;
-  if (latest - from > MAX_RANGE) from = latest - MAX_RANGE;
-  if (from > latest) return;
-  const onCurve = cfg.pools[0].v === 'curve';
-  // safety net: a pons token that graduated while alerts were off moves to its v4 pool here
-  if (onCurve && latest - ((cfg.pons && cfg.pons.checked) || 0) > PONS_RECHECK) {
-    const lp = await ponsLaunch(cfg.chain, cfg.token).catch(() => null);
-    cfg.pons = Object.assign({}, cfg.pons, { checked: latest });
-    if (lp && lp.phase === 2) {
-      const res = await setupToken(Object.assign({}, cfg, { pons: null }), cfg.token, cfg.chain, null, true);
-      if (res.cfg) { row.cfg = JSON.stringify(res.cfg); await saveChatCfg(D, row.chat_id, res.cfg); await sendGraduation(env, D, row.chat_id, res.cfg); return; }
-    }
-    row.cfg = JSON.stringify(cfg); await saveChatCfg(D, row.chat_id, cfg);
-  }
-  const logs = await getLogsRange(cfg.chain, cfg.pools, from, latest, cfg.token);
-  if (!logs) { console.log('buybot logs failed', from, latest, rpcLastError); return; }   // try the same range next minute
-  const advance = () => { row.last_block = latest; return D.prepare('UPDATE bb_chats SET last_block = ? WHERE chat_id = ?').bind(latest, row.chat_id).run(); };
-
-  const byTx = {};
-  let grad = null;
-  for (const l of logs) {
-    if (l.topics[0] === TOPIC_GRADUATED) { grad = { block: parseInt(l.blockNumber, 16), tx: l.transactionHash }; continue; }
-    const p = poolMap[(l.topics[0] === TOPIC_V4 ? l.topics[1] : l.address).toLowerCase()];
-    if (!p) continue;
-    let tokOut = 0n, qIn = 0n, buyer = null;
-    if (l.topics[0] === TOPIC_CURVE_BUY) {
-      qIn = word(l.data, 0); tokOut = word(l.data, 1);   // the buyer shown is the wallet that sent the transaction (recipients are often trading-bot contracts)
-    } else if (l.topics[0] === TOPIC_V4) {
-      // v4 amounts are from the trader's side: positive = received, negative = paid
-      const a0 = sword(l.data, 0), a1 = sword(l.data, 1);
-      const tokD = p.t0 ? a0 : a1, qD = p.t0 ? a1 : a0;
-      if (tokD > 0n && qD < 0n) { tokOut = tokD; qIn = -qD; }
-    } else if (l.topics[0] === TOPIC_V2) {
-      const a0In = word(l.data, 0), a1In = word(l.data, 1), a0Out = word(l.data, 2), a1Out = word(l.data, 3);
-      if (p.t0) { tokOut = a0Out; qIn = a1In; } else { tokOut = a1Out; qIn = a0In; }
-    } else {
-      const a0 = sword(l.data, 0), a1 = sword(l.data, 1);
-      const tokD = p.t0 ? a0 : a1, qD = p.t0 ? a1 : a0;
-      if (tokD < 0n && qD > 0n) { tokOut = -tokD; qIn = qD; }
-    }
-    if (tokOut <= 0n || qIn <= 0n) continue;
-    const b = byTx[l.transactionHash] || (byTx[l.transactionHash] = { tx: l.transactionHash, tokens: 0, quote: 0, qsym: p.qsym, q: p.q });
-    b.tokens += units(tokOut, cfg.dec);
-    b.quote += units(qIn, p.qdec);
-    if (onCurve) cfg.curvePx = units(qIn, p.qdec) / Math.max(units(tokOut, cfg.dec), 1e-18);   // last curve price, in the quote token
-  }
-  // graduated: post the curve buys of this range, then move to the new Uniswap v4 pool
-  if (grad) {
-    const pool = await ponsPool(cfg.chain, grad.tx, cfg.token);
-    if (!pool) return;   // receipt not readable yet: try the same range again
-    const next = Object.assign({}, cfg, { pools: [pool], pair: pool.a, pons: Object.assign({}, cfg.pons, { phase: 2 }) });
-    delete next.curvePx;
-    row.cfg = JSON.stringify(next);
-    await D.prepare('UPDATE bb_chats SET cfg = ?, last_block = ? WHERE chat_id = ?').bind(row.cfg, grad.block - 1, row.chat_id).run();
-    row.last_block = grad.block - 1;   // the v4 pool is read from the graduation block on
-    const curveBuys = Object.values(byTx);
-    if (curveBuys.length) await postBuys(env, D, row, cfg, curveBuys, null);
-    await sendGraduation(env, D, row.chat_id, next);
+  if (!cfg.enabled || cfg.chain !== 'solana') return;   // an older Robinhood setup stays quiet until /buybot set
+  if (!cfg.pool) return armCheck(env, D, row, cfg);
+  const P = cfg.pool;
+  // trading bots also list the pool in many transactions that trade nothing: read the transactions only when the vaults moved.
+  // The newest transaction is listed first, then the vaults are read: when they did not move and were read at or after
+  // that transaction's slot, nothing up to it traded, so the cursor skips ahead past the bots' empty transactions.
+  // (The RPC answers can come from servers a few slots apart: without the slot check a fresh trade could be skipped.)
+  const head = row.last_block ? await signatures(P.a, { limit: 1 }) : null;
+  const vs = await vaultState(P);
+  const vslot = accSlot;
+  if (vs && vaultMem[row.chat_id] === vs) {
+    const h = Array.isArray(head) && head[0];
+    if (h && h.signature !== row.last_block && h.slot && vslot >= h.slot) await setCursor(D, row, h.signature);
+    if (P.kind === 'dbc') await gradSafety(env, D, row, cfg);
     return;
   }
-  let buys = Object.values(byTx);
-  if (!buys.length) { await advance(); return; }
-  await postBuys(env, D, row, cfg, buys, advance);
+  let sigs = await signatures(P.a, Object.assign({ limit: 100 }, row.last_block ? { until: String(row.last_block) } : {}));
+  if (!Array.isArray(sigs)) { console.log('buybot signatures failed', rpcLastError); return; }
+  for (let p = 0; row.last_block && p < 4 && sigs.length && sigs.length % 100 === 0; p++) {   // more than one page since the cursor
+    const more = await signatures(P.a, { limit: 100, until: String(row.last_block), before: sigs[sigs.length - 1].signature });
+    if (!Array.isArray(more) || !more.length) break;
+    sigs = sigs.concat(more);
+  }
+  if (!sigs.length) { if (vs && afterMem[row.chat_id] === vs) vaultMem[row.chat_id] = vs; return; }   // nothing new listed: in sync, or the trade is not listed yet
+  // oldest first, at most MAX_TX per check: a rush is read over the next checks, nothing is skipped
+  const ok = [];
+  let upto = null;
+  for (const s of sigs.slice().reverse()) {
+    if (!s.err) { if (ok.length === MAX_TX) break; ok.push(s); }
+    upto = s.signature;
+  }
+  const txs = ok.length ? await rpc(ok.map(s => ['getTransaction', [s.signature, TX_OPTS]])) : [];
+  if (txs.some(t => !t)) {   // listed but not readable yet on this node: try again, at most 3 times
+    missMem[row.chat_id] = (missMem[row.chat_id] || 0) + 1;
+    if (missMem[row.chat_id] < 3) return;
+    console.log('buybot transactions not readable', txs.filter(t => !t).length, 'of', txs.length, rpcLastError);
+  }
+  // Read in order, following the vault balances from one transaction to the next (the trading bots' empty transactions
+  // carry them too). A transaction that starts from other balances than the last one left means a trade in between is
+  // not listed yet (RPC servers a few slots apart): stop before it and read on from there at the next check.
+  // Within one slot the list order is not always the run order, so a slot is matched up by its balances.
+  let after0 = afterMem[row.chat_id] || null;
+  if (after0 && !after0.startsWith(P.a + ':')) after0 = null;   // a new pool (graduation, new token): nothing to follow yet
+  const V = txs.map(t => vaultsOf(t, P));
+  const slotOf = i => (txs[i] && txs[i].slot) || 0;
+  const chain = n => {
+    let a = after0;
+    const rem = [], seen = new Set();
+    for (let i = 0; i < n; i++) rem.push(i);
+    while (rem.length) {
+      const s = Math.min(...rem.map(slotOf));
+      const pick = rem.find(i => slotOf(i) === s && (!V[i] || !V[i].pre || !a || V[i].pre === a));
+      if (pick === undefined) break;
+      seen.add(pick);
+      if (V[pick]) a = V[pick].post;
+      rem.splice(rem.indexOf(pick), 1);
+    }
+    return { a, seen };
+  };
+  const all = ok.length;
+  let k = all, after;
+  for (;;) {   // the longest start of the list that follows on without a gap
+    const r = chain(k);
+    let j = 0;
+    while (j < k && r.seen.has(j)) j++;
+    if (j === k) { after = r.a; break; }
+    k = j;
+  }
+  if (k < all && (gapMem[row.chat_id] || 0) < 5) {
+    gapMem[row.chat_id] = (gapMem[row.chat_id] || 0) + 1;
+    ok.length = k; txs.length = k;
+    upto = k ? ok[k - 1].signature : null;
+    if (!upto) return;
+  } else {
+    if (k < all) { after = V.reduce((a, v) => (v ? v.post : a), after); k = -1; }   // still a gap after 5 checks: go on
+    gapMem[row.chat_id] = 0;
+  }
+  const newest = upto;
+  // the vaults count as seen only when everything listed was read and the last transaction left them as they are now
+  const synced = vs && k === all && upto === sigs[0].signature && after === vs;
+  const done = async sig => { await setCursor(D, row, sig); if (after) afterMem[row.chat_id] = after; if (synced) vaultMem[row.chat_id] = vs; else delete vaultMem[row.chat_id]; };
+  missMem[row.chat_id] = 0;
+
+  const buys = [];
+  let grad = null;
+  for (let i = 0; i < ok.length; i++) {
+    const tx = txs[i];
+    if (!tx) continue;
+    if (P.kind === 'dbc' && ((tx.meta && tx.meta.logMessages) || []).includes(MIGRATION_LOG)) { grad = { sig: ok[i].signature, tx }; break; }
+    const b = decodeBuy(tx, ok[i].signature, P, cfg);
+    if (b) buys.push(b);
+  }
+  // graduated: the new DAMM v2 pool is created in the migration transaction
+  if (grad) {
+    const f = await poolFromTx(grad.tx, cfg.token, ['damm']);
+    if (f.pool) { await graduate(env, D, row, cfg, f.pool, grad.sig, buys); return; }
+    console.log('buybot migration seen, DAMM v2 pool not found', grad.sig);   // the safety check finds it later
+  }
+  if (!buys.length) { await done(newest); return; }
+  await postBuys(env, D, row, cfg, buys, () => done(newest));
+}
+
+// waiting for launch: watch the token's own transactions until one of them writes to its Meteora pool
+async function armCheck(env, D, row, cfg) {
+  const sigs = await signatures(cfg.token, Object.assign({ limit: 25 }, row.last_block ? { until: String(row.last_block) } : {}));
+  if (!Array.isArray(sigs) || !sigs.length) return;
+  const ok = sigs.filter(s => !s.err).reverse().slice(0, 4);   // oldest first: the launch transaction comes first
+  for (const s of ok) {
+    const [tx] = await rpc([['getTransaction', [s.signature, TX_OPTS]]]);
+    if (!tx) return;   // not readable yet: next check
+    const f = await poolFromTx(tx, cfg.token, ['dbc', 'damm']);
+    if (!f.pool) continue;
+    const info = await tokenInfo(cfg.token).catch(() => null);
+    const sym = (f.meta && f.meta.symbol) || (info && info.sym) || (await assetSymbol(cfg.token)) || cfg.sym || 'TOKEN';
+    const next = Object.assign({}, cfg, { pool: f.pool, sym }, info ? { dec: info.dec, supply: info.supply } : {});
+    delete next.arm;
+    // read the pool from its first transaction on, so the launch buys are posted too
+    row.cfg = JSON.stringify(next);
+    await saveChatCfg(D, row.chat_id, next, null);
+    row.last_block = null;
+    return;
+  }
+  await setCursor(D, row, sigs[0].signature);
+}
+
+// moves the alerts to the DAMM v2 pool: curve buys first, then the graduation alert
+async function graduate(env, D, row, cfg, pool, fromSig, curveBuys) {
+  const next = Object.assign({}, cfg, { pool });
+  row.cfg = JSON.stringify(next);
+  let cursor = fromSig;   // the DAMM v2 pool is read from the migration on
+  if (!cursor) { const s = await signatures(pool.a, { limit: 1 }); cursor = Array.isArray(s) && s[0] ? s[0].signature : null; }
+  await saveChatCfg(D, row.chat_id, next, cursor);
+  row.last_block = cursor;
+  if (curveBuys && curveBuys.length) await postBuys(env, D, row, cfg, curveBuys, null);
+  await sendGraduation(env, D, row.chat_id, next);
+}
+async function gradSafety(env, D, row, cfg) {
+  const g = gradMem[row.chat_id] || (gradMem[row.chat_id] = { t: 0, since: 0 });
+  if (Date.now() - g.t < (g.since ? 60000 : GRAD_RECHECK)) return;
+  g.t = Date.now();
+  const [acc] = await accounts([cfg.pool.a]);
+  const p = readPool(cfg.pool.a, acc, cfg.token);
+  if (!p || !p.migrated) { g.since = 0; return; }
+  if (!g.since) { g.since = Date.now(); return; }   // give the live check a minute to see the migration itself
+  // missed: find the migration among the curve's latest transactions, else ask DexScreener
+  const sigs = await signatures(cfg.pool.a, { limit: 15 });
+  for (const s of (Array.isArray(sigs) ? sigs : []).filter(x => !x.err)) {
+    const [tx] = await rpc([['getTransaction', [s.signature, TX_OPTS]]]);
+    if (!tx || !((tx.meta && tx.meta.logMessages) || []).includes(MIGRATION_LOG)) continue;
+    const f = await poolFromTx(tx, cfg.token, ['damm']);
+    if (f.pool) { delete gradMem[row.chat_id]; await graduate(env, D, row, cfg, f.pool, null, []); return; }
+  }
+  const pool = await dexDammPool(cfg.token);
+  if (pool) { delete gradMem[row.chat_id]; await graduate(env, D, row, cfg, pool, null, []); }
 }
 
 // prices the buys, keeps those above the minimum and posts one alert (the biggest buy, with the others listed under it)
 async function postBuys(env, D, row, cfg, buys, advance) {
-  let px;
-  if (cfg.pools[0].v === 'curve') {
-    const qUsd = await quoteUsdOf(cfg.pools[0], D);
-    if (!qUsd || !cfg.curvePx) return;   // no ETH price yet: keep these blocks for the next check
-    px = { priceUsd: cfg.curvePx * qUsd, priceNative: cfg.curvePx, mcap: cfg.curvePx * qUsd * (cfg.supply || 1e9) };
-  } else px = await dexPair(cfg, D);
-  if (!px || !px.priceUsd) return;   // no price yet: keep these blocks for the next minute
+  const px = await priceOf(cfg, D);
+  if (!px.solUsd) return;   // no SOL price yet: keep these transactions for the next check
   if (advance) await advance();
-  const priceUsd = px ? px.priceUsd : 0, mcap = px ? px.mcap : 0;
-  // USD value from what the buyer paid (quote token x its USD price); token price as fallback
-  const quoteUsd = px && px.priceNative ? px.priceUsd / px.priceNative : 0;
-  const mainQ = cfg.pools[0].q;
-  for (const b of buys) b.usd = (quoteUsd && b.q === mainQ) ? b.quote * quoteUsd : b.tokens * priceUsd;
+  let mcap = px.mcap;
+  if (!mcap) { const l = buys[buys.length - 1]; mcap = l.tokens ? (l.quote / l.tokens) * px.solUsd * (cfg.supply || 1e9) : 0; }   // pool not readable: last trade price
+  for (const b of buys) b.usd = b.quote * px.solUsd;
   buys = buys.filter(b => b.usd >= cfg.minUsd).sort((a, b) => b.usd - a.usd);
-  if (!buys.length) return;
-  // one alert per check: the biggest buy gets the full alert, the others are listed under it
-  const top = buys[0], rest = buys.slice(1);
-
-  // buyer = sender of the transaction; position from its balance right after the buy
-  if (!top.from) { const [tx] = await rpc(cfg.chain, [['eth_getTransactionByHash', [top.tx]]]); top.from = tx && tx.from; }
-  if (top.from) {
-    const [balHex] = await rpc(cfg.chain, [['eth_call', [{ to: cfg.token, data: '0x70a08231' + pad32(top.from) }, 'latest']]]);
-    const bal = balHex ? units(BigInt(balHex), cfg.dec) : 0;
-    top.newHolder = bal <= top.tokens * 1.001;
-    top.pos = top.newHolder ? 0 : (top.tokens / Math.max(bal - top.tokens, 1e-18)) * 100;
+  // the live stream and the poller both see each buy: whoever posts it first claims it
+  const mine = [];
+  for (const b of buys) {
+    const r = await D.prepare('INSERT OR IGNORE INTO bb_posted (chat_id, sig, t) VALUES (?, ?, ?)').bind(String(row.chat_id), b.tx, Date.now()).run();
+    if (r.meta && r.meta.changes) mine.push(b);
   }
-
-  await sendBuy(env, D, row.chat_id, cfg, top, mcap, false, rest);
+  if (!mine.length) return;
+  await sendSlot(D, row.chat_id);
+  // one alert at a time: the biggest buy gets the full alert, the others are listed under it
+  await sendBuy(env, D, row.chat_id, cfg, mine[0], mcap, false, mine.slice(1));
+}
+// at most one alert per POLL_MS per group, shared by the live stream and the poller (Telegram allows 20 a minute)
+async function sendSlot(D, chatId) {
+  const k = 'sent:' + chatId;
+  for (let i = 0; i < 30; i++) {
+    const now = Date.now();
+    const r = await D.prepare("INSERT INTO bb_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE CAST(bb_kv.v AS INTEGER) <= ?")
+      .bind(k, String(now), now - POLL_MS).run();
+    if (r.meta && r.meta.changes) return;
+    await sleep(400);
+  }
 }
 
 async function deleteExpired(env, D) {
   const due = await D.prepare('SELECT rowid AS id, chat_id, msg_id FROM bb_pending WHERE expires <= ? LIMIT 25').bind(Date.now()).all();
   for (const r of due.results) await tg(env, 'deleteMessage', { chat_id: r.chat_id, message_id: r.msg_id });
   if (due.results.length) await D.prepare(`DELETE FROM bb_pending WHERE rowid IN (${due.results.map(r => r.id).join(',')})`).run();
+  await D.prepare('DELETE FROM bb_posted WHERE t < ?').bind(Date.now() - 6 * 3600000).run();
 }
 const kvNum = async (D, k) => { const r = await D.prepare('SELECT v FROM bb_kv WHERE k = ?').bind(k).first(); return r ? Number(r.v) || 0 : 0; };
 const kvPut = (D, k, v) => D.prepare('INSERT INTO bb_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').bind(k, String(v)).run();
@@ -877,7 +1126,7 @@ async function takeLock(D) {
 // One run at a time checks every POLL_MS (loopMs = 0: a single check). Scheduled runs start every minute:
 // while a run is checking, the new ones stop at once; near the end of its 5 min the next run waits and takes over.
 async function runBuyBot(env, loopMs = LOOP_MS) {
-  rpcOverride = (env.RPC_URL || '').trim() || null;
+  rpcOverride = (env.SOLANA_RPC_URL || '').trim() || null;
   const D = await bbDb(env);
   const start = Date.now();
   if (!(await takeLock(D))) {
@@ -918,65 +1167,104 @@ async function dsJson(url, tries = 3) {   // DexScreener sometimes refuses a req
   }
   return null;
 }
-async function setupToken(cfgOld, ca, chain, pair, skipPons) {
-  const ch = CHAINS[chain];
-  const launch = (pair || skipPons) ? null : await ponsLaunch(chain, ca).catch(() => null);
-  if (launch && launch.phase !== 2) {
-    const q = launch.pairToken;
-    const calls = [['eth_call', [{ to: ca, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: ca, data: '0x313ce567' }, 'latest']], ['eth_call', [{ to: ca, data: '0x18160ddd' }, 'latest']]];
-    if (q !== NATIVE) calls.push(['eth_call', [{ to: q, data: '0x95d89b41' }, 'latest']], ['eth_call', [{ to: q, data: '0x313ce567' }, 'latest']]);
-    const [sh, dh, th, qsh, qdh] = await rpc(chain, calls);
-    const dec = dh ? parseInt(dh, 16) || 18 : 18;
-    const qsym = q === NATIVE ? 'ETH' : (abiString(qsh) || 'TOKEN'), qdec = q === NATIVE ? 18 : (qdh ? parseInt(qdh, 16) || 18 : 18);
-    if (q !== NATIVE && !/^(W?ETH|USD)/i.test(qsym)) return { error: 'This pons launch is paired with ' + esc(qsym) + '. On the curve only ETH and USD pairs are supported.' };
-    const pools = [{ a: launch.curve, v: 'curve', dex: 'pons', q, qsym, qdec, t0: false }];
-    const cfg = Object.assign({}, BB_DEFAULT, cfgOld || {}, { chain, token: ca, sym: abiString(sh) || 'TOKEN', dec, supply: th ? units(BigInt(th), dec) : 1e9, pools, pair: null, pons: { phase: launch.phase }, enabled: true });
-    delete cfg.curvePx;
-    return { cfg };
+// Meteora pools of the token listed on DexScreener (bonding curve and DAMM v2), checked on chain; biggest liquidity first
+async function dexPools(mint) {
+  const j = await dsJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  const pairs = ((j && j.pairs) || []).filter(p => p.chainId === 'solana' && p.baseToken && p.baseToken.address === mint);
+  const cand = pairs.filter(p => p.dexId === 'meteoradbc' || (p.dexId === 'meteora' && (p.labels || []).includes('DYN2')))
+    .sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0)).slice(0, 4);
+  const accs = await accounts(cand.map(p => p.pairAddress));
+  return { sym: pairs[0] && pairs[0].baseToken.symbol, pools: cand.map((p, i) => readPool(p.pairAddress, accs[i], mint)).filter(Boolean) };
+}
+async function dexDammPool(mint) {
+  try { const p = (await dexPools(mint)).pools.find(x => x.kind === 'damm'); if (p) return p; } catch (e) { /* ask the chain */ }
+  return (await chainPools(mint)).find(p => p.kind === 'damm') || null;
+}
+// Meteora pools of the token read straight from the chain (DexScreener often refuses the Worker):
+// the bonding curve first, then the DAMM v2 pools paired with SOL, the one holding the most SOL first
+async function chainPools(mint) {
+  const keysOf = async (program, filters) => {
+    try {
+      const [r] = await rpc([['getProgramAccounts', [program, { encoding: 'base64', commitment: 'confirmed', dataSlice: { offset: 0, length: 0 }, filters }]]]);
+      return Array.isArray(r) ? r.map(x => x.pubkey).slice(0, 8) : [];
+    } catch (e) { return []; }
+  };
+  const at = (offset, bytes) => ({ memcmp: { offset, bytes } });
+  const list = [
+    ...(await keysOf(DBC.program, [at(DBC.mint, mint)])),
+    ...(await keysOf(DAMM.program, [at(DAMM.mintA, mint), at(DAMM.mintB, WSOL)])),
+    ...(await keysOf(DAMM.program, [at(DAMM.mintA, WSOL), at(DAMM.mintB, mint)])),
+  ];
+  if (!list.length) return [];
+  const accs = await accounts(list);
+  const pools = list.map((a, i) => readPool(a, accs[i], mint)).filter(Boolean);
+  const vaults = await accounts(pools.map(p => p.solVault));
+  const sol = v => { if (!v || v.d.length < 72) return 0n; let n = 0n; for (let i = 7; i >= 0; i--) n = n * 256n + BigInt(v.d[64 + i]); return n; };
+  const rank = p => (p.kind === 'dbc' && !p.migrated ? 2 : p.kind === 'damm' ? 1 : 0);
+  return pools.map((p, i) => ({ p, s: sol(vaults[i]) }))
+    .sort((a, b) => rank(b.p) - rank(a.p) || (b.s > a.s ? 1 : b.s < a.s ? -1 : 0)).map(x => x.p);
+}
+async function setupToken(cfgOld, mint, poolArg) {
+  const keep = {};
+  for (const k of BB_SETTINGS) if (cfgOld && cfgOld[k] !== undefined) keep[k] = cfgOld[k];
+  const info = await tokenInfo(mint);
+  let pool = null, sym = null;
+  if (poolArg) {
+    const [acc] = await accounts([poolArg]);
+    pool = readPool(poolArg, acc, mint);
+    if (!pool) return { error: 'That pool is not a Meteora bonding curve (DBC) or DAMM v2 pool of this token paired with SOL.' };
+  } else if (info) {
+    const ds = await dexPools(mint).catch(() => ({ pools: [] }));
+    sym = ds.sym || null;
+    pool = ds.pools.find(p => p.kind === 'dbc' && !p.migrated) || ds.pools.find(p => p.kind === 'damm') || null;
+    if (!pool) {   // DexScreener did not answer: read the pools from the chain
+      const cp = await chainPools(mint);
+      pool = cp.find(p => p.kind === 'dbc' && !p.migrated) || cp.find(p => p.kind === 'damm') || null;
+    }
+    if (!pool) {   // not found yet: look at the token's latest transactions
+      const sigs = await signatures(mint, { limit: 10 });
+      for (const s of (Array.isArray(sigs) ? sigs : []).filter(x => !x.err).slice(0, 6)) {
+        const [tx] = await rpc([['getTransaction', [s.signature, TX_OPTS]]]);
+        if (!tx) continue;
+        const f = await poolFromTx(tx, mint, ['dbc', 'damm']);
+        if (f.meta && f.meta.symbol) sym = sym || f.meta.symbol;
+        if (f.pool && !(f.pool.kind === 'dbc' && f.pool.migrated)) { pool = f.pool; break; }
+      }
+    }
   }
-  let pairs = null;
-  if (pair) pairs = await dsJson(`https://api.dexscreener.com/latest/dex/pairs/${ch.ds}/${pair}`);
-  if (!pairs) pairs = await dsJson(`https://api.dexscreener.com/token-pairs/v1/${ch.ds}/${ca}`);
-  if (!pairs) pairs = await dsJson(`https://api.dexscreener.com/latest/dex/tokens/${ca}`);
-  if (!pairs) { await new Promise(r => setTimeout(r, 1500)); pairs = await dsJson(`https://api.dexscreener.com/token-pairs/v1/${ch.ds}/${ca}`); }
-  if (!pairs) return { error: 'Could not reach DexScreener right now. Try again in a minute.' };
-  const list = (Array.isArray(pairs) ? pairs : (pairs.pairs || (pairs.pair ? [pairs.pair] : [])))
-    .filter(p => p.chainId === ch.ds && p.baseToken && p.baseToken.address.toLowerCase() === ca.toLowerCase())
-    .filter(p => {
-      const lb = p.labels || [];
-      if (lb.includes('v4')) return !!ch.v4pm && /^0x[0-9a-f]{64}$/i.test(p.pairAddress);   // v4 pool id
-      return lb.some(l => l === 'v2' || l === 'v3') && /^0x[0-9a-f]{40}$/i.test(p.pairAddress);
-    })
-    .filter(p => ((p.liquidity && p.liquidity.usd) || 0) >= 500)
-    .sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0))
-    .slice(0, 3);
-  if (!list.length) return { error: 'No Uniswap v2, v3 or v4 pool with liquidity found for this token on ' + ch.name + '.' };
-  const quotes = [...new Set(list.map(p => p.quoteToken.address.toLowerCase()))];
-  const dec = await rpc(chain, [ca, ...quotes].map(a => ['eth_call', [{ to: a, data: '0x313ce567' }, 'latest']]));
-  const decOf = i => { const v = dec[i] ? parseInt(dec[i], 16) : NaN; return v >= 0 && v <= 36 ? v : 18; };   // native ETH has no contract: 18
-  const pools = list.map(p => {
-    const q = p.quoteToken.address.toLowerCase();
-    const v = (p.labels || []).includes('v4') ? 'v4' : (p.labels || []).includes('v2') ? 'v2' : 'v3';
-    return { a: p.pairAddress, v, dex: p.dexId, q, qsym: q === NATIVE ? 'ETH' : p.quoteToken.symbol, qdec: q === NATIVE ? 18 : decOf(1 + quotes.indexOf(q)), t0: ca.toLowerCase() < q };
+  if (pool && pool.kind === 'dbc' && pool.migrated) return { error: 'This token already left its bonding curve, but its DAMM v2 pool was not found. Add it by hand: /buybot set &lt;mint&gt; &lt;pool&gt;' };
+  if (pool) {   // only SOL pairs
+    const [v] = await rpc([['getAccountInfo', [pool.solVault, { encoding: 'jsonParsed', commitment: 'confirmed' }]]]);
+    const vm = v && v.value && v.value.data && v.value.data.parsed && v.value.data.parsed.info && v.value.data.parsed.info.mint;
+    if (vm !== WSOL) return { error: 'Only pools paired with SOL are supported.' };
+  }
+  if (info && !pool) return { error: 'No Meteora bonding curve or DAMM v2 pool found for this token on Solana yet. If it just launched or graduated, try again in a minute.' };
+  if (pool && !sym) sym = (info && info.sym) || (await assetSymbol(mint)) || null;   // DexScreener did not answer: ask the chain
+  const sameToken = cfgOld && cfgOld.token === mint;
+  const cfg = Object.assign({}, BB_DEFAULT, keep, {
+    chain: 'solana', token: mint, sym: sym || (sameToken && cfgOld.sym) || 'TOKEN',
+    dec: info ? info.dec : 6, supply: info ? info.supply : 1e9, pool, enabled: true,
   });
-  const cfg = Object.assign({}, BB_DEFAULT, cfgOld || {}, { chain, token: ca, sym: list[0].baseToken.symbol, dec: decOf(0), pools, pair: list[0].pairAddress, enabled: true });
-  delete cfg.pons; delete cfg.curvePx;
+  if (!pool) cfg.arm = true;   // the token does not exist yet: alerts start with its launch
   return { cfg };
 }
 
-function bbStatus(cfg, lastBlock) {
+function bbStatus(cfg) {
   if (!cfg) return '<b>Poof buy bot</b>\nNot set up in this chat yet.\n\n' + BB_HELP;
-  const ch = CHAINS[cfg.chain];
+  if (cfg.chain !== 'solana') return '<b>Poof buy bot</b>\nThe buy bot runs on Solana now. Set the token again with /buybot set &lt;mint&gt;.\n\n' + BB_HELP;
   const tiers = Array.isArray(cfg.tiers) ? cfg.tiers.map(fmtUsd).join(' / ') : 'auto (' + MCAP_PCT.join('% / ') + '% of MCap, at least ' + FIXED_TIERS.map(fmtUsd).join(' / ') + ')';
+  const where = !cfg.pool
+    ? 'Waiting for launch: alerts start by themselves with the first trade on Meteora. The address stays hidden here until then.\n'
+    : `Pool: ${cfg.pool.kind === 'dbc' ? 'Meteora bonding curve' : 'Meteora DAMM v2'} (SOL)\n<code>${cfg.pool.a}</code>\n`
+      + (cfg.pool.kind === 'dbc' ? 'When the curve fills, alerts move to Meteora DAMM v2 by themselves.\n' : '');
   return `<b>Poof buy bot</b> · ${cfg.enabled ? 'on' : 'off'}\n\n`
-    + `Token: <b>$${esc(cfg.sym)}</b> on ${ch.name}\n<code>${cfg.token}</code>\n`
-    + `Pools: ${cfg.pools.map(p => `${p.dex} ${p.v} (${esc(quoteName(p.qsym))})`).join(', ')}\n`
-    + (cfg.pools[0] && cfg.pools[0].v === 'curve' ? 'pons launch: on the bonding curve now, alerts move to Uniswap v4 by themselves when it graduates.\n' : '')
+    + (cfg.pool ? `Token: <b>$${esc(cfg.sym || 'TOKEN')}</b> on Solana\n<code>${cfg.token}</code>\n` : 'Token: on Solana\n')
+    + where
     + `Min buy: ${fmtUsd(cfg.minUsd)} · Alerts poof after: ${cfg.ttl ? cfg.ttl + ' min' : 'never'}\n`
     + `Tiers: ${tiers}\nCustom emoji: ${cfg.emoji ? 'on' : 'off'}\n\n` + BB_HELP;
 }
 const BB_HELP = '<b>Commands</b>\n'
-  + '/buybot set &lt;contract&gt; [pair] - track this token here (Robinhood Chain)\n'
+  + '/buybot set &lt;mint&gt; [pool] - track this Solana token here (Meteora bonding curve, then DAMM v2)\n'
   + '/buybot on | off\n'
   + '/buybot min 25 - smallest buy shown, in $\n'
   + '/buybot ttl 10 - minutes before small alerts poof (0 = keep)\n'
@@ -986,7 +1274,7 @@ const BB_HELP = '<b>Commands</b>\n'
   + '/buybot remove';
 
 async function handleBuybot(env, msg, text) {
-  rpcOverride = (env.RPC_URL || '').trim() || null;
+  rpcOverride = (env.SOLANA_RPC_URL || '').trim() || null;
   if (!(await isAdmin(env, msg))) { await reply(env, msg, (msg.chat.type === 'private' || await isOfficial(env, msg.chat.id)) ? 'Only admins can set up the buy bot.' : 'Filters and the buy bot only work in official Poof groups.'); return; }
   if (msg.chat.type === 'private' && !/^\/buybot\s+(poll)\b/i.test(text)) { await reply(env, msg, 'Use /buybot inside the group where the alerts should go.'); return; }
   let D;
@@ -995,22 +1283,27 @@ async function handleBuybot(env, msg, text) {
   const sub = (args[0] || '').toLowerCase();
   const cur = await getChatCfg(D, msg.chat.id);
   const cfg = cur ? Object.assign({}, BB_DEFAULT, cur.cfg) : null;
-  const need = async () => { if (!cfg) { await reply(env, msg, 'Set a token first: /buybot set &lt;contract&gt;'); return false; } return true; };
+  const need = async () => { if (!cfg || cfg.chain !== 'solana') { await reply(env, msg, 'Set a token first: /buybot set &lt;mint&gt;'); return false; } return true; };
 
-  if (!sub) { await reply(env, msg, bbStatus(cfg, cur && cur.last_block)); return; }
+  if (!sub) { await reply(env, msg, bbStatus(cfg)); return; }
 
   if (sub === 'set') {
-    const ca = args[1] || '';
-    const extra = args.slice(2);
-    const pair = extra.find(x => /^0x([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(x)) || null;   // pool address, or v4 pool id
-    const chain = (extra.find(x => !/^0x/i.test(x)) || 'robinhood').toLowerCase();
-    if (!/^0x[0-9a-fA-F]{40}$/.test(ca)) { await reply(env, msg, 'Use: /buybot set 0x... (token contract address)'); return; }
-    if (!CHAINS[chain]) { await reply(env, msg, 'Supported chains: ' + Object.keys(CHAINS).join(', ')); return; }
-    const res = await setupToken(cfg, ca, chain, pair);
+    const mint = args[1] || '';
+    const poolArg = args.slice(2).find(isAddr) || null;
+    if (!isAddr(mint)) { await reply(env, msg, 'Use: /buybot set &lt;mint&gt; (Solana token address)'); return; }
+    let res, cursor = null;
+    try {
+      res = await setupToken(cfg, mint, poolArg);
+      if (!res.error) {
+        // start from now: no old buys (while waiting for launch, from the token's newest transaction)
+        const s = await signatures(res.cfg.pool ? res.cfg.pool.a : mint, { limit: 1 });
+        if (!Array.isArray(s)) throw new Error('no answer');
+        cursor = s[0] ? s[0].signature : null;
+      }
+    } catch (e) { await reply(env, msg, 'Could not reach Solana right now. Try again in a minute.'); return; }
     if (res.error) { await reply(env, msg, res.error); return; }
-    const [bn] = await rpc(chain, [['eth_blockNumber', []]]);
-    await saveChatCfg(D, msg.chat.id, res.cfg, parseInt(bn, 16) || 0);
-    await reply(env, msg, 'Buy bot is tracking this token now.\n\n' + bbStatus(res.cfg));
+    await saveChatCfg(D, msg.chat.id, res.cfg, cursor);
+    await reply(env, msg, (res.cfg.pool ? 'Buy bot is tracking this token now.' : 'Buy bot is armed. Alerts start by themselves with the launch.') + '\n\n' + bbStatus(res.cfg));
     return;
   }
   if (sub === 'remove') { await D.prepare('DELETE FROM bb_chats WHERE chat_id = ?').bind(String(msg.chat.id)).run(); await reply(env, msg, 'Buy bot removed from this chat.'); return; }
@@ -1024,12 +1317,13 @@ async function handleBuybot(env, msg, text) {
   else if (sub === 'tiers' && (args[1] || '').toLowerCase() === 'auto') cfg.tiers = 'auto';
   else if (sub === 'tiers' && args.length >= 4 && args.slice(1, 4).every(x => +x > 0)) cfg.tiers = args.slice(1, 4).map(Number).sort((a, b) => a - b);
   else if (sub === 'test') {
-    const px = await dexPair(cfg, D);
-    const mcap = px ? px.mcap : 2000000;
+    const px = await priceOf(cfg, D).catch(() => ({ solUsd: 0, mcap: 0, priceSol: 0 }));
+    const mcap = px.mcap || 2000000;
+    const sol = px.solUsd || 150;
+    const price = px.priceSol ? px.priceSol * sol : 0.0016;
     const t = tierLimits(cfg, mcap);
-    const price = px && px.priceUsd ? px.priceUsd : 0.0016;
-    const fake = '0x' + 'f'.repeat(64), who = '0x8f10b468b06c6fd214b65f87778827f7d113f996';
-    const samples = [t[0] * 0.5, t[1] * 1.2, t[2] * 1.5].map((usd, i) => ({ tx: fake, usd, tokens: usd / price, quote: usd / 2600, qsym: cfg.pools[0].qsym, from: who, newHolder: i !== 1, pos: 96 }));
+    const fake = '1'.repeat(64), who = '1'.repeat(32);
+    const samples = [t[0] * 0.5, t[1] * 1.2, t[2] * 1.5].map((usd, i) => ({ tx: fake, usd, tokens: usd / price, quote: usd / sol, qsym: 'SOL', from: who, newHolder: i !== 1, pos: 96 }));
     for (const s of samples) {
       const r = await sendBuy(env, D, msg.chat.id, cfg, s, mcap, true);
       if (!r.ok) { await reply(env, msg, 'Test alert failed: ' + r.description); break; }
@@ -1041,8 +1335,117 @@ async function handleBuybot(env, msg, text) {
   await reply(env, msg, bbStatus(cfg));
 }
 
+// ---------- live buys: transactionSubscribe on the tracked pools ----------
+// A long-lived connection object keeps one WebSocket to the RPC provider open and gets every confirmed transaction that touches a tracked
+// pool the moment it lands, read the same way as the poller reads them. The poller keeps running as a safety net;
+// each buy is posted once (bb_posted). The scheduled run wakes the stream every minute, its alarm every 30 s.
+const streamStub = env => env.BUYSTREAM.get(env.BUYSTREAM.idFromName('main'));
+export class BuyStream {
+  constructor(state, env) {
+    this.state = state; this.env = env;
+    this.ws = null; this.pools = ''; this.subReq = 0; this.subId = null; this.reqId = 1;
+    this.last = 0; this.opened = 0; this.stats = { msgs: 0, buys: 0, connects: 0, errors: 0 };
+    this.rows = []; this.queue = {}; this.timers = {}; this.subAt = 0;
+  }
+  async fetch() { await this.ensure(); return Response.json(this.status()); }
+  async alarm() { await this.ensure(); }
+  status() {
+    return { open: !!this.ws, subscribed: !!this.subId, pools: this.pools ? this.pools.split(',').length : 0,
+      last_msg_s: this.last ? Math.round((Date.now() - this.last) / 1000) : null, up_s: this.opened ? Math.round((Date.now() - this.opened) / 1000) : 0, ...this.stats };
+  }
+  async ensure() {
+    try { await this.state.storage.setAlarm(Date.now() + 30000); } catch (e) { /* next wake */ }
+    rpcOverride = (this.env.SOLANA_RPC_URL || '').trim() || null;
+    if (!rpcOverride) return;
+    try {
+      const D = await bbDb(this.env);
+      const ok = await allowedChats(this.env);
+      this.rows = (await D.prepare('SELECT chat_id, cfg, last_block FROM bb_chats').all()).results
+        .filter(x => ok.has(String(x.chat_id)))
+        .map(r => ({ row: r, cfg: Object.assign({}, BB_DEFAULT, JSON.parse(r.cfg)) }))
+        .filter(x => x.cfg.enabled && x.cfg.chain === 'solana' && x.cfg.pool);
+    } catch (e) { this.stats.errors++; console.log('buystream rows', e && e.message); return; }
+    const pools = [...new Set(this.rows.map(x => x.cfg.pool.a))].sort().join(',');
+    // pings are answered, and a busy pool streams all the time: 90 s of silence means the link is gone
+    if (this.ws && Date.now() - this.last > 90000) this.close();
+    if (!pools) { this.close(); return; }
+    if (!this.ws) await this.open();
+    if (!this.ws) return;
+    if (pools !== this.pools || !this.subId) { if (Date.now() - this.subAt > 20000 || pools !== this.pools) this.subscribe(pools); }
+    this.send({ method: 'ping' });
+  }
+  async open() {
+    try {
+      const r = await fetch(rpcOverride, { headers: { Upgrade: 'websocket' } });
+      const ws = r.webSocket;
+      if (!ws) { this.stats.errors++; console.log('buystream no websocket', r.status); return; }
+      ws.accept();
+      this.ws = ws; this.last = Date.now(); this.opened = Date.now(); this.pools = ''; this.subId = null; this.subAt = 0;
+      this.stats.connects++;
+      ws.addEventListener('message', e => this.onMessage(e.data));
+      const gone = () => { if (this.ws === ws) { this.ws = null; this.subId = null; this.pools = ''; } };
+      ws.addEventListener('close', gone);
+      ws.addEventListener('error', gone);
+    } catch (e) { this.stats.errors++; console.log('buystream open', String(e && e.message).replace(/https?:\/\/\S+/g, '[url]')); }
+  }
+  close() { const ws = this.ws; this.ws = null; this.subId = null; this.pools = ''; try { if (ws) ws.close(1000, 'reconnect'); } catch (e) { /* gone */ } }
+  send(o) {
+    if (!this.ws) return 0;
+    const id = this.reqId++;
+    try { this.ws.send(JSON.stringify(Object.assign({ jsonrpc: '2.0', id }, o))); } catch (e) { this.close(); return 0; }
+    return id;
+  }
+  subscribe(pools) {
+    if (this.subId) this.send({ method: 'transactionUnsubscribe', params: [this.subId] });
+    this.subId = null; this.pools = pools; this.subAt = Date.now();
+    this.subReq = this.send({ method: 'transactionSubscribe', params: [
+      { accountInclude: pools.split(','), failed: false, vote: false },
+      { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', showRewards: false, maxSupportedTransactionVersion: 1 },
+    ] });
+  }
+  onMessage(data) {
+    this.last = Date.now();
+    let m;
+    try { m = JSON.parse(typeof data === 'string' ? data : new TextDecoder().decode(data)); } catch (e) { return; }
+    if (m.id && m.id === this.subReq) {
+      if (typeof m.result === 'number') this.subId = m.result;
+      else { this.stats.errors++; this.pools = ''; console.log('buystream subscribe', JSON.stringify(m.error || m).slice(0, 200)); }
+      return;
+    }
+    if (m.method !== 'transactionNotification') return;
+    this.stats.msgs++;
+    const r = m.params && m.params.result;
+    if (!r || !r.transaction || !r.signature) return;
+    const tx = Object.assign({}, r.transaction, { slot: r.slot });
+    try { this.take(tx, r.signature); } catch (e) { this.stats.errors++; console.log('buystream read', e && e.message); }
+  }
+  take(tx, sig) {
+    if (!tx.meta || tx.meta.err || !tx.transaction || !tx.transaction.message) return;
+    const keys = txKeys(tx);
+    for (const x of this.rows) {
+      if (!keys.includes(x.cfg.pool.a)) continue;
+      const b = decodeBuy(tx, sig, x.cfg.pool, x.cfg);
+      if (!b) continue;
+      this.stats.buys++;
+      const id = x.row.chat_id;
+      (this.queue[id] = this.queue[id] || []).push(b);
+      if (!this.timers[id]) this.timers[id] = setTimeout(() => { this.timers[id] = null; this.flush(id); }, 700);   // gather buys landing together
+    }
+  }
+  async flush(id) {
+    const buys = this.queue[id] || [];
+    this.queue[id] = [];
+    const x = this.rows.find(r => r.row.chat_id === id);
+    if (!buys.length || !x) return;
+    try { await postBuys(this.env, await bbDb(this.env), x.row, x.cfg, buys, null); }
+    catch (e) { this.stats.errors++; console.log('buystream post', e && e.message); }
+    if ((this.queue[id] || []).length && !this.timers[id]) this.timers[id] = setTimeout(() => { this.timers[id] = null; this.flush(id); }, 100);
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
+    if (env.BUYSTREAM) ctx.waitUntil(streamStub(env).fetch('https://stream/ensure').catch(e => console.log('buystream wake', e && e.message)));
     try { await runBuyBot(env); } catch (e) { console.log('buybot run', e && e.message); }
   },
 
@@ -1074,12 +1477,22 @@ export default {
     if (url.pathname === '/health') {
       const out = {};
       const t = async (k, u, o) => { try { const r = await fetch(u, o); out[k] = r.status; } catch (e) { out[k] = 'error'; } };
-      for (const u of CHAINS.robinhood.rpcs) await t(new URL(u).host, u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' });
-      await t('dexscreener', 'https://api.dexscreener.com/latest/dex/pairs/robinhood/0x0000000000000000000000000000000000000000');
-      if (env.RPC_URL) {
-        rpcOverride = env.RPC_URL.trim();
-        try { const [bn] = await rpc('robinhood', [['eth_blockNumber', []]]); out.rpc_key = bn ? 'ok' : 'no answer'; } catch (e) { out.rpc_key = 'failing'; }
-      }
+      const slot = { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]}' };
+      for (const u of SOLANA.rpcs) await t(new URL(u).host, u, slot);
+      await t('dexscreener', 'https://api.dexscreener.com/latest/dex/tokens/' + WSOL);
+      await t('coinbase', 'https://api.coinbase.com/v2/prices/SOL-USD/spot');
+      if (env.SOLANA_RPC_URL) {
+        const u = env.SOLANA_RPC_URL.trim();
+        const why = () => (rpcLastError.split(': ').slice(1).join(': ') || 'no answer').slice(0, 120);
+        try { const [s] = await rpcOnce(u, [['getSlot', []]]); out.solana_rpc = s ? 'ok' : why(); } catch (e) { out.solana_rpc = 'failing ' + String(e && e.message).replace(/https?:\/\/\S+/g, '').slice(0, 80); }
+        // the calls the buy bot lives on: a transaction list and a transaction
+        try {
+          const [l] = await rpcOnce(u, [['getSignaturesForAddress', [WSOL, { limit: 1, commitment: 'confirmed' }]]]);
+          out.solana_rpc_list = Array.isArray(l) ? 'ok' : why();
+          if (Array.isArray(l) && l[0]) { const [t] = await rpcOnce(u, [['getTransaction', [l[0].signature, TX_OPTS]]]); out.solana_rpc_tx = t ? 'ok' : why(); }
+        } catch (e) { out.solana_rpc_list = 'failing ' + String(e && e.message).replace(/https?:\/\/\S+/g, '').slice(0, 80); }
+      } else out.solana_rpc = 'missing';
+      if (env.BUYSTREAM) { try { out.stream = await (await streamStub(env).fetch('https://stream/ensure')).json(); } catch (e) { out.stream = 'error ' + (e && e.message); } }
       return Response.json(out);
     }
 
